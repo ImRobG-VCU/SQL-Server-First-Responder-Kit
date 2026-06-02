@@ -32,7 +32,8 @@ ALTER PROCEDURE
     @OutputDatabaseName sysname = NULL,
     @OutputSchemaName sysname = N'dbo',      /*ditto as below*/
     @OutputTableName sysname = N'BlitzLock', /*put a standard here no need to check later in the script*/
-    @ExportToExcel bit = 0
+    @ExportToExcel bit = 0,
+    @SkipExecutionPlans bit = 0 /*skip the execution plans result set and return only the findings rollup*/
 )
 WITH RECOMPILE
 AS
@@ -103,7 +104,10 @@ BEGIN
        
         @TargetTimestampColumnName: The name of the datetime column for filtering by date range (optional)
 
-   
+        /*Output options*/
+        @SkipExecutionPlans: Set to 1 to skip the execution plans result set and return only the findings rollup
+
+
     To learn more, visit http://FirstResponderKit.org where you can download new
     versions for free, watch training videos on how it works, get more info on
     the findings, contribute your own code, and more.
@@ -4383,9 +4387,18 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
            
                 RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
+                /*
+                When @SkipExecutionPlans = 1, skip gathering and returning the
+                execution plans result set and jump straight to the findings rollup.
+                */
+                IF @SkipExecutionPlans = 1
+                BEGIN
+                    GOTO ReturnDeadlockFindings;
+                END;
+
                 SET @d = CONVERT(varchar(40), GETDATE(), 109);
                 RAISERROR('Getting available execution plans for deadlocks %s', 0, 1, @d) WITH NOWAIT;
-             
+
                 SELECT DISTINCT
                     available_plans =
                         'available_plans',
@@ -4576,10 +4589,12 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
                 OPTION(RECOMPILE, LOOP JOIN, HASH JOIN);
 
                 RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
-           
+
+                ReturnDeadlockFindings:
+
                 SET @d = CONVERT(varchar(40), GETDATE(), 109);
                 RAISERROR('Returning findings %s', 0, 1, @d) WITH NOWAIT;
-           
+
                 SELECT
                     df.check_id,
                     df.database_name,
@@ -4737,7 +4752,9 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
             OutputTableName =
                 @OutputTableName,
             ExportToExcel =
-                @ExportToExcel;
+                @ExportToExcel,
+            SkipExecutionPlans =
+                @SkipExecutionPlans;
 
         SELECT
             declared_variables =

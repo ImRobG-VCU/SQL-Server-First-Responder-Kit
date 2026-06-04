@@ -33,7 +33,7 @@ ALTER PROCEDURE
     @OutputSchemaName sysname = N'dbo',      /*ditto as below*/
     @OutputTableName sysname = N'BlitzLock', /*put a standard here no need to check later in the script*/
     @ExportToExcel bit = 0,
-    @SkipExecutionPlans bit = 0 /*skip the execution plans result set and return only the findings rollup*/
+    @SkipExecutionPlans bit = 0 /*skip the execution plans result set (still returns deadlocks + findings rollup)*/
 )
 WITH RECOMPILE
 AS

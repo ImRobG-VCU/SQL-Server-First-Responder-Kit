@@ -348,7 +348,7 @@ It's designed for query tuners, so it includes things like memory grants, degree
 
 When the same query runs differently on two SQL Servers (fast on dev, slow on prod), the cause is almost always a difference in environment: stats, indexes, row counts, sniffed parameters, compat level, cardinality estimator version, hardware, MAXDOP, or live contention. sp_BlitzPlanCompare diffs two servers along every dimension that affects a specific query plan and returns a prioritized list of differences, the two plans side by side, and - when applicable - a copy/paste reproducer for parameter sniffing.
 
-> **Installation:** sp_BlitzPlanCompare ships in the `OptionalScripts` folder and is **not** included in `Install-All-Scripts.sql` or `Install-Azure.sql`. To use it, open `OptionalScripts/sp_BlitzPlanCompare.sql` in SSMS or Azure Data Studio, switch to the database where you want it installed (typically `master` so it's callable from any DB via `EXEC master.dbo.sp_BlitzPlanCompare`), and run the script. For linked-server mode, install it on both servers.
+> **Installation:** sp_BlitzPlanCompare ships in the `OptionalScripts` folder and is **not** included in `Install-All-Scripts.sql` or `Install-Azure.sql`. To use it, open `OptionalScripts/sp_BlitzPlanCompare.sql` in SSMS, switch to the database where you want it installed (typically `master` so it's callable from any DB via `EXEC master.dbo.sp_BlitzPlanCompare`), and run the script. For linked-server mode, install it on both servers.
 
 ### Parameters
 

@@ -2806,7 +2806,7 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
 
         RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-        /*Check 8 gives you more info queries for sp_BlitzCache & BlitzQueryStore*/
+        /*Check 8 gives you more info queries for sp_BlitzCache & sp_QuickieStore*/
         SET @d = CONVERT(varchar(40), GETDATE(), 109);
         RAISERROR('Check 8 more info part 1 BlitzCache %s', 0, 1, @d) WITH NOWAIT;
 
@@ -2891,7 +2891,7 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
         IF (@ProductVersionMajor >= 13 OR @Azure = 1)
         BEGIN
             SET @d = CONVERT(varchar(40), GETDATE(), 109);
-            RAISERROR('Check 8 more info part 2 BlitzQueryStore %s', 0, 1, @d) WITH NOWAIT;
+            RAISERROR('Check 8 more info part 2 sp_QuickieStore %s', 0, 1, @d) WITH NOWAIT;
 
             WITH
                 deadlock_stack AS
@@ -2923,12 +2923,24 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
                 dow.database_name,
                 object_name = ds.proc_name,
                 finding_group = N'More Info - Query',
+                /* sp_QuickieStore is Erik Darling's Query Store explorer; install it
+                   from https://erikdarling.com/sp_quickiestore/ if you don't already
+                   have it. sp_BlitzQueryStore (the prior FRK tool that lived here) is
+                   deprecated.
+
+                   Pull @database_name from dow.database_name (derived from
+                   dow.database_id at deadlock time) rather than ds.database_name
+                   (PARSENAME(ds.proc_name, 3)). PARSENAME returns NULL for any
+                   proc_name that isn't 3-part, and QUOTENAME(NULL, '''') would
+                   NULL out the whole finding via string concat. dow.database_name
+                   is already used 4 lines up for the output column, so this stays
+                   consistent. */
                 finding =
-                    N'EXECUTE sp_BlitzQueryStore ' +
-                    N'@DatabaseName = ' +
-                    QUOTENAME(ds.database_name, N'''') +
+                    N'EXECUTE sp_QuickieStore ' +
+                    N'@database_name = ' +
+                    QUOTENAME(dow.database_name, N'''') +
                     N', ' +
-                    N'@StoredProcName = ' +
+                    N'@procedure_name = ' +
                     QUOTENAME(ds.proc_only_name, N'''') +
                     N';'
             FROM deadlock_stack AS ds

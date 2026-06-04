@@ -389,7 +389,7 @@ When the same query runs differently on two SQL Servers (fast on dev, slow on pr
 
 ```tsql
 /* 1. You know the plan hash exactly */
-EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = 0xABCD1234567890;
+EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = 0xABCD1234567890EF;
 
 /* 2. You only know the query hash (usually enough) */
 EXEC dbo.sp_BlitzPlanCompare @QueryHash = 0x1234567890ABCDEF;
@@ -409,7 +409,7 @@ EXEC dbo.sp_BlitzPlanCompare @StoredProcName = 'dbo.big_proc';
 
 ```tsql
 /* Step 1 — on the server where you noticed the slowness */
-EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = 0xABCD1234567890;
+EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = 0xABCD1234567890EF;
 ```
 
 You get back a single `CallStack` column — a complete `EXEC dbo.sp_BlitzPlanCompare @CompareToXML = N'...';` with the snapshot XML already embedded and single quotes escaped. **Click the cell, copy it, paste it into a query window connected to the OTHER server, hit F5.** The comparison runs there and returns the prioritized diff plus both plans as clickable XML.
@@ -420,7 +420,7 @@ How cross-server plan resolution works: the snapshot carries the stable `QueryHa
 
 ```tsql
 /* Needs RPC OUT and the proc installed on both sides. */
-EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = 0xABCD1234567890,
+EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = 0xABCD1234567890EF,
                              @LinkedServer  = 'OtherSrv';
 ```
 
@@ -454,7 +454,7 @@ The local side passes its `query_hash` (not `query_plan_hash`) to the remote —
 ### What's compared
 
 * **Server and hardware**: `@@SERVERNAME`, edition, version, CPU count, scheduler count, physical memory, max server memory, committed target.
-* **sp_configure allowlist**: MAXDOP, CTFP, max/min server memory, optimize for ad-hoc workloads, priority boost, lightweight pooling, query governor cost limit, parallel index ops, max worker threads.
+* **sp_configure allowlist**: MAXDOP, CTFP, max/min server memory, optimize for ad-hoc workloads, priority boost, lightweight pooling, query governor cost limit, max worker threads.
 * **Trace flags**: `DBCC TRACESTATUS(-1)` (box SQL + MI only; silently skipped on Azure SQL DB).
 * **Database config** (per plan-referenced database): compat level, collation, RCSI, auto create/update stats, page verify, recovery model, Query Store on/off, parameterization, containment.
 * **Database-scoped configurations**: the full row from `sys.database_scoped_configurations`, including `LEGACY_CARDINALITY_ESTIMATION`, `MAXDOP`, `LAST_QUERY_PLAN_STATS`.

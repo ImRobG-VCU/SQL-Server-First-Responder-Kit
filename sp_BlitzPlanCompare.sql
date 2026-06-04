@@ -63,8 +63,6 @@ BEGIN
     RETURN;
 END;
 
-DECLARE @nl NVARCHAR(2) = NCHAR(13) + NCHAR(10);
-
 IF @Help = 1
 BEGIN
     PRINT '
@@ -94,6 +92,17 @@ BEGIN
       - sp_BlitzPlanCompare installed on BOTH servers
       - RPC OUT enabled on the linked server
       - The local server is NOT Azure SQL DB or Synapse (no linked server support)
+
+    SSMS setup for Mode 1 (snapshot emit):
+      The CallStack column is returned as NVARCHAR(MAX) (not XML, so it can cross
+      linked-server INSERT EXEC in Mode 3). SSMS clips NVARCHAR results in the
+      grid at 65,535 characters by default, which will truncate the snapshot for
+      any non-trivial plan. Before running Mode 1, crank the limit up:
+        Tools -> Options -> Query Results -> SQL Server -> Results to Grid ->
+        Maximum Characters Retrieved -> Non XML data: 2147483647
+      Then open a new query window (the setting only applies to windows opened
+      after the change). Results to Text will clip at 8192 no matter what;
+      use Results to Grid for Mode 1.
 
     Plan source: prefers the actual execution plan from sys.dm_exec_query_plan_stats
     (richer runtime info: actual memory grant used, spills that fired, per-operator wait
@@ -190,8 +199,6 @@ END;
    ===================================================================== */
 DECLARE @Mode             TINYINT,
         @EngineEdition    INT      = CAST(SERVERPROPERTY('EngineEdition')  AS INT),
-        @ProductMajor     INT      = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)),
-                                          CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128))) - 1) AS INT),
         @LocalServerName  NVARCHAR(256) = CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(256)),
         @QueryHashBin     BINARY(8),     /* the query_hash of the resolved plan (or from mode 2 XML) */
         @MatchCount       INT,
@@ -822,8 +829,14 @@ SELECT 'MaxUsedMemoryKB', CAST(v AS NVARCHAR(40)), v
 FROM (SELECT @PlanXmlForEmit.value('(//p:MemoryGrantInfo/@MaxUsedMemory)[1]', 'BIGINT') AS v) x
 WHERE v IS NOT NULL;
 
-/* Spills: count of <SpillOccurred> elements in the actual plan (runtime-only warning).
-   Reported regardless - 0 vs 0 matches as "Same" and suppressed; any difference surfaces. */
+/* Spills: count of <SpillOccurred> elements in the plan. Unlike the other PlanRuntime
+   metrics above (which use XPaths that return NULL when the actual plan is missing and
+   are filtered by WHERE v IS NOT NULL), count() always returns 0 for an empty result -
+   so this row is emitted with value 0 even on an estimated plan that has no runtime
+   warnings. That's intentional: 0 vs 0 matches as "Same" and gets suppressed by the
+   diff engine; 0 vs N or N vs M surfaces. The diff engine's 25% noise filter has an
+   exact-match carve-out for PlanRuntime.SpillCount so even a single spill on one side
+   is reported. */
 ;WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
 INSERT INTO #PlanRuntime ([Setting], ValueText, ValueNumeric)
 SELECT 'SpillCount', CAST(v AS NVARCHAR(20)), v
@@ -1534,7 +1547,13 @@ BEGIN
        remote QueryHash from the snapshot and the local resolution logic tries it as a
        plan_hash first, falls back to query_hash. The remote proc's plan-resolution
        block does the same thing when we hand it a query_hash disguised as a plan_hash. */
-    SET @sql = N'EXEC ' + @LinkedServer + N'.master.dbo.sp_BlitzPlanCompare @QueryPlanHash = @hash;';
+    /* Normalize and quote @LinkedServer before injecting into the 4-part name.
+       sys.servers stores bare names; the caller may pass 'OtherSrv' or '[OtherSrv]'.
+       Strip outer brackets first, then re-wrap with QUOTENAME so names containing
+       a period, space, or other special character still produce a valid identifier
+       and the dynamic SQL can't be tampered with via a maliciously-named linked server. */
+    DECLARE @LinkedServerSafe SYSNAME = REPLACE(REPLACE(@LinkedServer, N'[', N''), N']', N'');
+    SET @sql = N'EXEC ' + QUOTENAME(@LinkedServerSafe) + N'.master.dbo.sp_BlitzPlanCompare @QueryPlanHash = @hash;';
 
     IF @Debug = 1
         RAISERROR('Linked-server invocation: %s (passing local QueryHash so remote can resolve its own plan with a matching query_hash)', 0, 1, @sql) WITH NOWAIT;
@@ -1557,14 +1576,23 @@ BEGIN
         SET @PrefixPos = CHARINDEX(@XmlPrefix, @RemoteCallStack);
         IF @PrefixPos > 0
         BEGIN
-            /* Trim prefix, then trim the closing N''';' suffix (3 chars: ' + ; + optional WS). */
+            /* Trim prefix off the front. */
             SET @XmlBody = SUBSTRING(@RemoteCallStack,
                                      @PrefixPos + LEN(@XmlPrefix),
                                      LEN(@RemoteCallStack));
-            /* Strip trailing ';' and the closing single quote. The CallStack
-               builder always emits ...''';' at the end. */
-            SET @XmlBody = LEFT(@XmlBody,
-                                LEN(@XmlBody) - 2);  -- drop ;'
+            /* Trim trailing whitespace / newlines that some clients (SSMS grid
+               copy/paste, older sqlcmd, custom result handlers) append before
+               we look at the closing punctuation. LEN already ignores trailing
+               spaces, but CR/LF/TAB need explicit stripping. */
+            WHILE LEN(@XmlBody) > 0
+              AND RIGHT(@XmlBody, 1) IN (NCHAR(13), NCHAR(10), NCHAR(9), N' ')
+                SET @XmlBody = LEFT(@XmlBody, LEN(@XmlBody) - 1);
+            /* Only strip the closing "';" if it's actually there. Defensive against
+               a remote returning text that doesn't end in the expected form (in
+               which case we want @RemoteXml = NULL and the existing "RemoteEmpty"
+               error path to fire, not silently mangle the payload). */
+            IF RIGHT(@XmlBody, 2) = N''';'
+                SET @XmlBody = LEFT(@XmlBody, LEN(@XmlBody) - 2);
             /* Undouble the single quotes (T-SQL string literal escaping). */
             SET @XmlBody = REPLACE(@XmlBody, N'''''', N'''');
 

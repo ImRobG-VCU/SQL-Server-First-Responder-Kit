@@ -2897,9 +2897,19 @@ END;
 ELSE
 BEGIN
   RAISERROR(N'Cleaning up old plans for your SPID', 0, 1) WITH NOWAIT;
-  /* Schema-drift guard: older versions did not have ai_query_plan; add it on the fly so @Reanalyze runs do not fail. */
+  /* Schema-drift guard: a ##BlitzCacheProcs left behind by an older version of this
+     proc may be missing the ai_* columns, so add any that are absent on the fly
+     rather than failing the @Reanalyze run. */
+  IF COL_LENGTH('tempdb..##BlitzCacheProcs','ai_prompt') IS NULL
+      ALTER TABLE ##BlitzCacheProcs ADD ai_prompt NVARCHAR(MAX) NULL;
   IF COL_LENGTH('tempdb..##BlitzCacheProcs','ai_query_plan') IS NULL
       ALTER TABLE ##BlitzCacheProcs ADD ai_query_plan NVARCHAR(MAX) NULL;
+  IF COL_LENGTH('tempdb..##BlitzCacheProcs','ai_advice') IS NULL
+      ALTER TABLE ##BlitzCacheProcs ADD ai_advice NVARCHAR(MAX) NULL;
+  IF COL_LENGTH('tempdb..##BlitzCacheProcs','ai_payload') IS NULL
+      ALTER TABLE ##BlitzCacheProcs ADD ai_payload NVARCHAR(MAX) NULL;
+  IF COL_LENGTH('tempdb..##BlitzCacheProcs','ai_raw_response') IS NULL
+      ALTER TABLE ##BlitzCacheProcs ADD ai_raw_response NVARCHAR(MAX) NULL;
   DELETE ##BlitzCacheProcs
     WHERE SPID = @@SPID
 	OPTION (RECOMPILE) ;
@@ -5322,7 +5332,8 @@ BEGIN
         Rows_    BIGINT,
         Scans    BIGINT,
         CPUms    BIGINT,
-        Elapms   BIGINT
+        Elapms   BIGINT,
+        Execs    BIGINT
     );
     /* SQL Server XQuery does not support the ancestor:: axis, so we build the
        parent-child RelOp map in two steps: first capture every ancestor-descendant
@@ -5343,7 +5354,8 @@ BEGIN
         SumCPUms  BIGINT,
         MaxElapms BIGINT,
         SumRows   BIGINT,
-        MaxScans  BIGINT
+        MaxScans  BIGINT,
+        SumExecs  BIGINT
     );
 
     DECLARE @cur_sql VARBINARY(64),
@@ -5352,7 +5364,9 @@ BEGIN
             @cur_plan_text NVARCHAR(MAX),
             @cur_has_actuals BIT,
             @cur_relop_count INT,
-            @nid INT, @cpu BIGINT, @elap BIGINT, @rows BIGINT, @scans BIGINT;
+            @cur_distinct_nodeids INT,
+            @cur_modify_errors INT,
+            @nid INT, @cpu BIGINT, @elap BIGINT, @rows BIGINT, @scans BIGINT, @execs BIGINT;
 
     DECLARE ai_plan_min_cursor CURSOR LOCAL FAST_FORWARD FOR
         SELECT SqlHandle, QueryHash, QueryPlan
@@ -5370,6 +5384,7 @@ BEGIN
             DELETE FROM @plan_anc_desc;
             DELETE FROM @plan_parent_child;
             DELETE FROM @plan_op_recalc;
+            SET @cur_modify_errors = 0;
 
             /* Does this plan have actuals? If not, estimated attributes are the
                only signal we have; do not strip estimates that lack an actual
@@ -5380,56 +5395,73 @@ BEGIN
             ') = 1 THEN 1 ELSE 0 END;
 
             /* 2a. Always-delete attributes: cost-percentage distractors per the issue, plus noise. */
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedTotalSubtreeCost'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@StatementSubTreeCost'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateCPU'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateIO'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@AvgRowSize'); END TRY BEGIN CATCH END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedTotalSubtreeCost'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@StatementSubTreeCost'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateCPU'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateIO'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@AvgRowSize'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
 
             /* Compile/hardware chatter — already surfaced in the metrics block. */
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CompileTime'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CompileCPU'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CompileMemory'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CachedPlanSize'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@MaxCompileMemory'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedAvailableDegreeOfParallelism'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedAvailableMemoryGrant'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedPagesCached'); END TRY BEGIN CATCH END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CompileTime'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CompileCPU'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CompileMemory'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@CachedPlanSize'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@MaxCompileMemory'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedAvailableDegreeOfParallelism'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedAvailableMemoryGrant'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedPagesCached'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
 
             /* Statement metadata of low AI value. */
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@StatementOptmEarlyAbortReason'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@StatementOptmLevel'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@RetrievedFromCache'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@SecurityPolicyApplied'); END TRY BEGIN CATCH END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@StatementOptmEarlyAbortReason'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@StatementOptmLevel'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@RetrievedFromCache'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@SecurityPolicyApplied'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
 
             /* Estimate attributes superseded by actuals — only strip when actuals exist. */
             IF @cur_has_actuals = 1
             BEGIN
-                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateRebinds'); END TRY BEGIN CATCH END CATCH;
-                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateRewinds'); END TRY BEGIN CATCH END CATCH;
-                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedRowsRead'); END TRY BEGIN CATCH END CATCH;
-                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedRowsForAllExecs'); END TRY BEGIN CATCH END CATCH;
-                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@TableCardinality'); END TRY BEGIN CATCH END CATCH;
-                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedExecutionMode'); END TRY BEGIN CATCH END CATCH;
+                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateRebinds'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimateRewinds'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedRowsRead'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedRowsForAllExecs'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@TableCardinality'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+                BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //@EstimatedExecutionMode'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
             END;
 
             /* 2b. Element deletion. */
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:OptimizerHardwareDependentProperties'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:OptimizerStatsUsage'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:TraceFlags'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:WaitStats'); END TRY BEGIN CATCH END CATCH;
-            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:ParameterList[not(p:ColumnReference)]'); END TRY BEGIN CATCH END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:OptimizerHardwareDependentProperties'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:OptimizerStatsUsage'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:TraceFlags'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:WaitStats'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
+            BEGIN TRY SET @cur_plan.modify(N'declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan"; delete //p:ParameterList[not(p:ColumnReference)]'); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
 
             /* 2c. Row-mode operator timing recalc (per-thread cumulative -> per-operator net).
-               Skipped for estimated-only plans and for plans with >500 RelOps. */
+               Skipped when:
+               - The plan is estimated-only (nothing to recalc).
+               - The plan has more than 500 RelOps. Each RelOp costs two .modify() calls
+                 (a delete plus an insert), and every .modify() rewrites the whole
+                 document, so the cap bounds a single plan to ~1,000 rewrites - roughly
+                 a second of CPU on a big plan. Plans over the cap still get the
+                 attribute/element stripping above and whitespace minification below;
+                 they only keep their original cumulative row-mode timings.
+               - NodeId values are not unique across the document. NodeId is only
+                 unique within a single statement, so on multi-statement plans
+                 (stored procedures, batches) //p:RelOp[@NodeId=...] would mix
+                 operators from different statements: the math would blend unrelated
+                 operators and the delete/insert would target the wrong nodes. */
             SET @cur_relop_count = @cur_plan.value(N'
                 declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan";
                 count(//p:RelOp)', 'int');
+            SET @cur_distinct_nodeids = @cur_plan.value(N'
+                declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+                count(distinct-values(//p:RelOp/@NodeId))', 'int');
 
-            IF @cur_has_actuals = 1 AND @cur_relop_count <= 500
+            IF @cur_has_actuals = 1
+               AND @cur_relop_count <= 500
+               AND @cur_distinct_nodeids = @cur_relop_count
             BEGIN
                 ;WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-                INSERT INTO @plan_op_thread (NodeId, Mode, ThreadId, Rows_, Scans, CPUms, Elapms)
+                INSERT INTO @plan_op_thread (NodeId, Mode, ThreadId, Rows_, Scans, CPUms, Elapms, Execs)
                 SELECT
                     ro.value('@NodeId', 'int'),
                     ro.value('@ActualExecutionMode', 'varchar(10)'),
@@ -5437,7 +5469,8 @@ BEGIN
                     ctr.value('@ActualRows', 'bigint'),
                     ctr.value('@ActualEndOfScans', 'bigint'),
                     ctr.value('@ActualCPUms', 'bigint'),
-                    ctr.value('@ActualElapsedms', 'bigint')
+                    ctr.value('@ActualElapsedms', 'bigint'),
+                    ctr.value('@ActualExecutions', 'bigint')
                 FROM @cur_plan.nodes('//p:RelOp') AS r(ro)
                 CROSS APPLY ro.nodes('p:RunTimeInformation/p:RunTimeCountersPerThread') AS c(ctr);
 
@@ -5474,16 +5507,17 @@ BEGIN
                     SELECT t.NodeId, t.ThreadId, t.Mode,
                            OwnCPUms  = CASE WHEN t.Mode = 'Row' THEN t.CPUms  - ISNULL(c.ChildCPUms, 0)  ELSE t.CPUms  END,
                            OwnElapms = CASE WHEN t.Mode = 'Row' THEN t.Elapms - ISNULL(c.ChildElapms, 0) ELSE t.Elapms END,
-                           t.Rows_, t.Scans
+                           t.Rows_, t.Scans, t.Execs
                     FROM @plan_op_thread t
                     LEFT JOIN child_sum c ON c.ParentNodeId = t.NodeId AND c.ThreadId = t.ThreadId
                 )
-                INSERT INTO @plan_op_recalc (NodeId, SumCPUms, MaxElapms, SumRows, MaxScans)
+                INSERT INTO @plan_op_recalc (NodeId, SumCPUms, MaxElapms, SumRows, MaxScans, SumExecs)
                 SELECT NodeId,
                        SUM(CASE WHEN OwnCPUms  < 0 THEN 0 ELSE OwnCPUms  END),
                        MAX(CASE WHEN OwnElapms < 0 THEN 0 ELSE OwnElapms END),
                        SUM(Rows_),
-                       MAX(Scans)
+                       MAX(Scans),
+                       SUM(Execs)
                 FROM per_thread
                 GROUP BY NodeId;
 
@@ -5492,23 +5526,23 @@ BEGIN
                    their threads 1..N (no Thread=0 to write into). */
                 WHILE EXISTS (SELECT 1 FROM @plan_op_recalc)
                 BEGIN
-                    SELECT TOP (1) @nid = NodeId, @cpu = SumCPUms, @elap = MaxElapms, @rows = SumRows, @scans = MaxScans
+                    SELECT TOP (1) @nid = NodeId, @cpu = SumCPUms, @elap = MaxElapms, @rows = SumRows, @scans = MaxScans, @execs = SumExecs
                     FROM @plan_op_recalc;
 
                     BEGIN TRY SET @cur_plan.modify(N'
                         declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan";
                         delete //p:RelOp[@NodeId=sql:variable("@nid")]/p:RunTimeInformation/p:RunTimeCountersPerThread
-                    '); END TRY BEGIN CATCH END CATCH;
+                    '); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
                     BEGIN TRY SET @cur_plan.modify(N'
                         declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan";
                         insert <p:RunTimeCountersPerThread Thread="0"
                                     ActualRows="{sql:variable("@rows")}"
                                     ActualEndOfScans="{sql:variable("@scans")}"
-                                    ActualExecutions="1"
+                                    ActualExecutions="{sql:variable("@execs")}"
                                     ActualCPUms="{sql:variable("@cpu")}"
                                     ActualElapsedms="{sql:variable("@elap")}" />
                         into (//p:RelOp[@NodeId=sql:variable("@nid")]/p:RunTimeInformation)[1]
-                    '); END TRY BEGIN CATCH END CATCH;
+                    '); END TRY BEGIN CATCH SET @cur_modify_errors += 1; END CATCH;
 
                     DELETE @plan_op_recalc WHERE NodeId = @nid;
                 END;
@@ -5523,11 +5557,16 @@ BEGIN
             SET @cur_plan_text = REPLACE(@cur_plan_text, N'>  ', N'>');
             SET @cur_plan_text = REPLACE(@cur_plan_text, N'> <', N'><');
 
+            /* NULL-safe matching: parent procedure/batch rows carry a NULL QueryHash,
+               and a plain equality match would silently discard their minimized text. */
             UPDATE ##BlitzCacheProcs
                SET ai_query_plan = @cur_plan_text
              WHERE SPID = @@SPID
-               AND SqlHandle = @cur_sql
-               AND QueryHash = @cur_hash;
+               AND ((@cur_sql  IS NOT NULL AND SqlHandle = @cur_sql)  OR (@cur_sql  IS NULL AND SqlHandle IS NULL))
+               AND ((@cur_hash IS NOT NULL AND QueryHash = @cur_hash) OR (@cur_hash IS NULL AND QueryHash IS NULL));
+
+            IF @Debug >= 1 AND @cur_modify_errors > 0
+                RAISERROR(N'Plan minimizer: %d transformation step(s) failed on one plan; partial minimization kept.', 0, 1, @cur_modify_errors) WITH NOWAIT;
         END TRY
         BEGIN CATCH
             /* Catastrophic failure on this plan (e.g., processing-instruction stub

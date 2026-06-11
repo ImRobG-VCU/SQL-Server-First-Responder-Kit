@@ -5360,6 +5360,7 @@ BEGIN
 
     DECLARE @cur_sql VARBINARY(64),
             @cur_hash BINARY(8),
+            @cur_plan_handle VARBINARY(64),
             @cur_plan XML,
             @cur_plan_text NVARCHAR(MAX),
             @cur_has_actuals BIT,
@@ -5368,14 +5369,18 @@ BEGIN
             @cur_modify_errors INT,
             @nid INT, @cpu BIGINT, @elap BIGINT, @rows BIGINT, @scans BIGINT, @execs BIGINT;
 
+    /* PlanHandle is part of the key because (SqlHandle, QueryHash) is not unique
+       when the same query hash has multiple distinct plans - without it, the
+       UPDATE below would stamp the last-fetched plan's minimized text onto every
+       row sharing the pair. Mirrors the AI-call cursor's matching. */
     DECLARE ai_plan_min_cursor CURSOR LOCAL FAST_FORWARD FOR
-        SELECT SqlHandle, QueryHash, QueryPlan
+        SELECT SqlHandle, QueryHash, PlanHandle, QueryPlan
         FROM ##BlitzCacheProcs
         WHERE SPID = @@SPID
           AND QueryPlan IS NOT NULL;
 
     OPEN ai_plan_min_cursor;
-    FETCH NEXT FROM ai_plan_min_cursor INTO @cur_sql, @cur_hash, @cur_plan;
+    FETCH NEXT FROM ai_plan_min_cursor INTO @cur_sql, @cur_hash, @cur_plan_handle, @cur_plan;
 
     WHILE @@FETCH_STATUS = 0
     BEGIN
@@ -5563,7 +5568,8 @@ BEGIN
                SET ai_query_plan = @cur_plan_text
              WHERE SPID = @@SPID
                AND ((@cur_sql  IS NOT NULL AND SqlHandle = @cur_sql)  OR (@cur_sql  IS NULL AND SqlHandle IS NULL))
-               AND ((@cur_hash IS NOT NULL AND QueryHash = @cur_hash) OR (@cur_hash IS NULL AND QueryHash IS NULL));
+               AND ((@cur_hash IS NOT NULL AND QueryHash = @cur_hash) OR (@cur_hash IS NULL AND QueryHash IS NULL))
+               AND ((@cur_plan_handle IS NOT NULL AND PlanHandle = @cur_plan_handle) OR (@cur_plan_handle IS NULL AND PlanHandle IS NULL));
 
             IF @Debug >= 1 AND @cur_modify_errors > 0
                 RAISERROR(N'Plan minimizer: %d transformation step(s) failed on one plan; partial minimization kept.', 0, 1, @cur_modify_errors) WITH NOWAIT;
@@ -5576,7 +5582,7 @@ BEGIN
                 RAISERROR(N'Plan minimization failed for one row; falling back to raw plan.', 0, 1) WITH NOWAIT;
         END CATCH;
 
-        FETCH NEXT FROM ai_plan_min_cursor INTO @cur_sql, @cur_hash, @cur_plan;
+        FETCH NEXT FROM ai_plan_min_cursor INTO @cur_sql, @cur_hash, @cur_plan_handle, @cur_plan;
     END;
     CLOSE ai_plan_min_cursor;
     DEALLOCATE ai_plan_min_cursor;

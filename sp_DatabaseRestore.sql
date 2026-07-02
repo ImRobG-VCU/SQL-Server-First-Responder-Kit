@@ -754,7 +754,6 @@ BEGIN
 			WHERE BackupFile LIKE N'%[_][0-9][0-9].' + @FileExtensionBak
 			AND	BackupFile LIKE N'%' + @Database + N'%'
 			AND	(REPLACE( RIGHT( REPLACE( BackupFile, RIGHT( BackupFile, CASE WHEN PATINDEX( '%[_]%', REVERSE( BackupFile ) ) <= 7 THEN PATINDEX( '%[_]%', REVERSE( BackupFile ) ) ELSE CHARINDEX( '.', REVERSE( BackupFile ) ) END ), '' ), 18 ), '_', '' ) > @StopAt);
-			AND	(REPLACE( RIGHT( REPLACE( BackupFile, RIGHT( BackupFile, PATINDEX( '%_[0-9][0-9]%', REVERSE( BackupFile ) ) ), '' ), 18 ), '_', '' ) > @StopAt);
 
 			DELETE
 			FROM @FileList

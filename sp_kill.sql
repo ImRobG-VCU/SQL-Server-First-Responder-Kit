@@ -72,7 +72,7 @@ BEGIN
 	SOFTWARE.
 	*/
 
-	SELECT @Version = '8.32', @VersionDate = '20260407';
+	SELECT @Version = '8.34', @VersionDate = '20260702';
 
 	IF(@VersionCheckMode = 1)
 	BEGIN
@@ -144,7 +144,7 @@ Parameters:
     NULL = normal operation (default). Pass 1 or 2 to enable emergency mode; 0 is not accepted.
     1 = Skip nearly all optional parts of the processing to minimize work performed by the procedure, but show the sql_text column.
     2 = Skip all optional parts of processing including the sql_text column.
-    Note: in emergency mode, @OrderBy = 'tempdb' is not meaningful because tempdb_allocations_mb is not collected.
+    Note: in emergency mode, @OrderBy = ''tempdb'' is not meaningful because tempdb_allocations_mb is not collected.
 
 Example usage:
   -- Just show recommendations, no killing:

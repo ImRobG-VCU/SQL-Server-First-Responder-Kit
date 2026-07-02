@@ -716,7 +716,7 @@ SELECT @StringToExecute = N' CASE WHEN YEAR(s.last_request_start_time) = 1900 TH
 						    +
 						    N'SUBSTRING(wt2.session_wait_info, 0, LEN(wt2.session_wait_info) ) AS top_session_waits ,'
 						    +																	
-						    N'COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
+						    N'COALESCE(s.open_transaction_count, r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
 						    CASE WHEN EXISTS (  SELECT 1 
                FROM sys.dm_tran_active_transactions AS tat
                JOIN sys.dm_tran_session_transactions AS tst

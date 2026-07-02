@@ -907,11 +907,13 @@ SELECT @StringToExecute = N' CASE WHEN YEAR(s.last_request_start_time) = 1900 TH
 
 		) AS qs_live
 
-	    WHERE s.session_id <> @@SPID 
+		WHERE s.session_id <> @@SPID 
 	    AND s.host_name IS NOT NULL
 		AND (r.database_id IS NULL OR r.database_id NOT IN (SELECT database_id FROM #WhoReadableDBs))
 	    '
-	    + CASE WHEN @ShowSleepingSPIDs = 0 THEN
+	    + CASE WHEN @ShowSleepingSPIDs = 0 AND @OnlyProblems = 1 THEN
+			    N' AND (COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid)) IS NOT NULL OR COALESCE(s.open_transaction_count, r.open_transaction_count, blocked.open_tran) >= 1)'
+			    WHEN @ShowSleepingSPIDs = 0 THEN
 			    N' AND COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid)) IS NOT NULL'
 			    WHEN @ShowSleepingSPIDs = 1 THEN
 			    N' AND (COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid)) IS NOT NULL OR COALESCE(r.open_transaction_count, blocked.open_tran) >= 1)'

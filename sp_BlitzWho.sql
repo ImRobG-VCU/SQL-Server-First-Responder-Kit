@@ -57,14 +57,15 @@ ALTER PROCEDURE dbo.sp_BlitzWho
 	@Version     VARCHAR(30) = NULL OUTPUT,
 	@VersionDate DATETIME = NULL OUTPUT,
     @VersionCheckMode BIT = 0,
-	@SortOrder NVARCHAR(256) = N'elapsed time'
+	@SortOrder NVARCHAR(256) = N'elapsed time',
+	@OnlyProblems BIT = 0
 AS
 BEGIN
 	SET NOCOUNT ON;
 	SET STATISTICS XML OFF;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
-	SELECT @Version = '8.32', @VersionDate = '20260407';
+	SELECT @Version = '8.34', @VersionDate = '20260702';
     
 	IF(@VersionCheckMode = 1)
 	BEGIN
@@ -715,7 +716,7 @@ SELECT @StringToExecute = N' CASE WHEN YEAR(s.last_request_start_time) = 1900 TH
 						    +
 						    N'SUBSTRING(wt2.session_wait_info, 0, LEN(wt2.session_wait_info) ) AS top_session_waits ,'
 						    +																	
-						    N'COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
+						    N'COALESCE(s.open_transaction_count, r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
 						    CASE WHEN EXISTS (  SELECT 1 
                FROM sys.dm_tran_active_transactions AS tat
                JOIN sys.dm_tran_session_transactions AS tst
@@ -906,11 +907,13 @@ SELECT @StringToExecute = N' CASE WHEN YEAR(s.last_request_start_time) = 1900 TH
 
 		) AS qs_live
 
-	    WHERE s.session_id <> @@SPID 
+		WHERE s.session_id <> @@SPID 
 	    AND s.host_name IS NOT NULL
 		AND (r.database_id IS NULL OR r.database_id NOT IN (SELECT database_id FROM #WhoReadableDBs))
 	    '
-	    + CASE WHEN @ShowSleepingSPIDs = 0 THEN
+	    + CASE WHEN @ShowSleepingSPIDs = 0 AND @OnlyProblems = 1 THEN
+			    N' AND (COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid)) IS NOT NULL OR COALESCE(s.open_transaction_count, r.open_transaction_count, blocked.open_tran) >= 1)'
+			    WHEN @ShowSleepingSPIDs = 0 THEN
 			    N' AND COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid)) IS NOT NULL'
 			    WHEN @ShowSleepingSPIDs = 1 THEN
 			    N' AND (COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid)) IS NOT NULL OR COALESCE(r.open_transaction_count, blocked.open_tran) >= 1)'
@@ -939,6 +942,18 @@ IF (@MinElapsedSeconds + @MinCPUTime + @MinLogicalReads + @MinPhysicalReads + @M
 	IF @MinBlockingSeconds > 0
 		SET @StringToExecute += N' OR (SELECT SUM(waittime / 1000) FROM @blocked) >= ' + CAST(@MinBlockingSeconds AS NVARCHAR(20));
 	SET @StringToExecute += N' ) ';
+	END
+
+IF @OnlyProblems = 1
+	BEGIN
+	/* Only show queries that are blocking, blocked, waiting, sleeping with an open transaction, or running >= 30 seconds. */
+	SET @StringToExecute += N' AND (
+		r.blocking_session_id <> 0
+		OR blocked.session_id IS NOT NULL
+		OR wt.wait_info IS NOT NULL
+		OR (s.status = ''sleeping'' AND COALESCE(s.open_transaction_count, r.open_transaction_count, blocked.open_tran, 0) >= 1)
+		OR ABS(COALESCE(r.total_elapsed_time, 0)) / 1000 >= 30
+	) ';
 	END
 
 SET @StringToExecute +=

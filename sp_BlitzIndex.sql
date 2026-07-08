@@ -77,7 +77,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.32', @VersionDate = '20260407';
+SELECT @Version = '8.34', @VersionDate = '20260702';
 SET @OutputType  = UPPER(@OutputType);
 
 IF(@VersionCheckMode = 1)
@@ -148,7 +148,10 @@ DECLARE @ErrorSeverity INT;
 DECLARE @ErrorState INT;
 DECLARE @Rowcount BIGINT;
 DECLARE @SQLServerProductVersion NVARCHAR(128);
+DECLARE @SQLServerProductVersionMajor INT;
 DECLARE @SQLServerEdition INT;
+DECLARE @SQLServerEditionName NVARCHAR(128);
+DECLARE @SQLServerVersionDescription NVARCHAR(256);
 DECLARE @FilterMB INT;
 DECLARE @collation NVARCHAR(256);
 DECLARE @NumDatabases INT;
@@ -256,6 +259,35 @@ SET @SortDirection = LOWER(@SortDirection);
 SET @LineFeed = CHAR(13) + CHAR(10);
 SELECT @SQLServerProductVersion = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128));
 SELECT @SQLServerEdition =CAST(SERVERPROPERTY('EngineEdition') AS INT); /* We default to online index creates where EngineEdition=3*/
+SELECT @SQLServerEditionName = CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128));
+SET @SQLServerProductVersionMajor =
+    CASE
+        WHEN @SQLServerProductVersion LIKE N'17.%' THEN 17
+        WHEN @SQLServerProductVersion LIKE N'16.%' THEN 16
+        WHEN @SQLServerProductVersion LIKE N'15.%' THEN 15
+        WHEN @SQLServerProductVersion LIKE N'14.%' THEN 14
+        WHEN @SQLServerProductVersion LIKE N'13.%' THEN 13
+        ELSE 0
+    END;
+SET @SQLServerVersionDescription =
+    CASE @SQLServerEdition
+        WHEN 5  THEN N'Azure SQL Database'
+        WHEN 6  THEN N'Azure Synapse Analytics dedicated SQL pool'
+        WHEN 8  THEN N'Azure SQL Managed Instance'
+        WHEN 9  THEN N'Azure SQL Edge'
+        WHEN 11 THEN N'Azure Synapse Analytics serverless SQL pool'
+        ELSE
+            N'SQL Server '
+            + CASE @SQLServerProductVersionMajor
+                WHEN 17 THEN N'2025 '
+                WHEN 16 THEN N'2022 '
+                WHEN 15 THEN N'2019 '
+                WHEN 14 THEN N'2017 '
+                WHEN 13 THEN N'2016 '
+                ELSE N''
+              END
+            + ISNULL(@SQLServerEditionName, N'')
+    END;
 SET @FilterMB=250;
 SELECT @ScriptVersionName = 'sp_BlitzIndex(TM) v' + @Version + ' - ' + DATENAME(MM, @VersionDate) + ' ' + RIGHT('0'+DATENAME(DD, @VersionDate),2) + ', ' + DATENAME(YY, @VersionDate);
 SET @IgnoreDatabases = REPLACE(REPLACE(LTRIM(RTRIM(@IgnoreDatabases)), CHAR(10), ''), CHAR(13), '');
@@ -365,6 +397,7 @@ DROP TABLE IF EXISTS #CheckConstraints;
 DROP TABLE IF EXISTS #FilteredIndexes;
 DROP TABLE IF EXISTS #Ignore_Databases;
 DROP TABLE IF EXISTS #IndexResumableOperations;
+DROP TABLE IF EXISTS #ColumnstoreIndexesNeedingRebuild;
 DROP TABLE IF EXISTS #dm_db_partition_stats_etc;
 DROP TABLE IF EXISTS #dm_db_index_operational_stats;
 
@@ -965,6 +998,19 @@ DROP TABLE IF EXISTS #dm_db_index_operational_stats;
               N', @TableName=' + QUOTENAME([table_name],N'''') + N';'
         );
 
+        /* Holds columnstore indexes on SQL Server 2022+ / Azure SQL DB whose
+           sys.column_store_segments rows are missing min_deep_data / max_deep_data
+           for eligible string, binary, uniqueidentifier, or datetimeoffset(>2)
+           columns - meaning the index needs to be rebuilt to enable predicate
+           pushdown. See check_id 130. */
+        CREATE TABLE #ColumnstoreIndexesNeedingRebuild
+        (
+            database_id SMALLINT NOT NULL,
+            [object_id] INT NOT NULL,
+            index_id INT NOT NULL,
+            eligible_columns NVARCHAR(MAX) NULL
+        );
+
         CREATE TABLE #Ignore_Databases
         (
           DatabaseName NVARCHAR(128),
@@ -1170,6 +1216,13 @@ IF @AI > 0
 
 IF @GetAllDatabases = 1
     BEGIN
+        /* HAS_DBACCESS gates databases the current principal can actually query.
+           Without this filter, three-part-name queries against sys.dm_db_partition_stats
+           hang indefinitely under a SQL Server permission/recompile bug instead of
+           erroring with Msg 916. The TRY/CATCH preflight below catches the same case
+           for legacy non-sysadmin paths, but HAS_DBACCESS also covers Azure principals
+           (##MS_DatabaseConnector##, CONNECT ANY DATABASE) that report as
+           sysadmin-equivalent yet can still be denied CONNECT per database. */
         INSERT INTO #DatabaseList (DatabaseName)
         SELECT  DB_NAME(database_id)
         FROM    sys.databases
@@ -1180,6 +1233,7 @@ IF @GetAllDatabases = 1
         AND DB_NAME(database_id) NOT LIKE 'rdsadmin%'
 		AND LOWER(name) NOT IN('dbatools', 'dbadmin', 'dbmaintenance', 'gcloud_cloudsqladmin')
         AND is_distributor = 0
+        AND HAS_DBACCESS(DB_NAME(database_id)) = 1
 		OPTION    ( RECOMPILE );
 
         /*Check if sysadmin 
@@ -1279,10 +1333,24 @@ IF @GetAllDatabases = 1
     END;
 ELSE
     BEGIN
+        /* Preflight: if an explicit @DatabaseName was supplied but the current principal
+           has no access to it, fail loud rather than letting downstream queries hang.
+           sp_BlitzIndex queries sys.dm_db_partition_stats via three-part name, which
+           under a SQL Server permission/recompile bug spins at 100% CPU forever instead
+           of erroring with Msg 916. */
+        IF @DatabaseName IS NOT NULL AND @DatabaseName <> N''
+        AND DB_ID(@DatabaseName) IS NOT NULL
+        AND ISNULL(HAS_DBACCESS(@DatabaseName), 0) = 0
+            BEGIN
+                DECLARE @CurrentLoginQuoted NVARCHAR(258) = QUOTENAME(SUSER_SNAME());
+                RAISERROR(N'The current login has no access to database %s. Run, against that database: CREATE USER %s FOR LOGIN %s; GRANT VIEW DATABASE STATE TO %s; GRANT VIEW DEFINITION TO %s;', 16, 1, @DatabaseName, @CurrentLoginQuoted, @CurrentLoginQuoted, @CurrentLoginQuoted, @CurrentLoginQuoted);
+                RETURN;
+            END;
+
         INSERT INTO #DatabaseList
                 ( DatabaseName )
-        SELECT CASE 
-		            WHEN @DatabaseName IS NULL OR @DatabaseName = N'' 
+        SELECT CASE
+		            WHEN @DatabaseName IS NULL OR @DatabaseName = N''
 		            THEN DB_NAME()
                     ELSE @DatabaseName END;
                END;
@@ -2919,6 +2987,80 @@ OPTION (RECOMPILE);';
                 END CATCH
         END;
 
+        /*
+        SQL Server 2022 added min_deep_data / max_deep_data to sys.column_store_segments
+        to enable predicate pushdown / segment elimination for string, binary,
+        uniqueidentifier, and datetimeoffset(>2) columns. Columnstore indexes that
+        existed before the upgrade keep NULLs in those columns until the index is
+        rebuilt. The min_deep_data column only exists on SQL Server 2022 (16.x) and
+        Azure SQL DB / MI, so guard the dynamic SQL on its presence rather than
+        version-gating ourselves.
+        */
+        IF EXISTS (SELECT 1 FROM sys.all_columns
+                   WHERE object_id = OBJECT_ID('sys.column_store_segments')
+                     AND name = 'min_deep_data')
+        BEGIN
+            SET @dsql = N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+;WITH eligible AS
+(
+    SELECT DISTINCT
+        p.[object_id],
+        p.index_id,
+        c.column_id,
+        c.name AS column_name
+    FROM ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_segments AS seg
+    JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partitions AS p
+        ON seg.partition_id = p.partition_id
+    JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.indexes AS i
+        ON p.[object_id] = i.[object_id]
+       AND p.index_id = i.index_id
+    JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.index_columns AS ic
+        ON ic.[object_id] = p.[object_id]
+       AND ic.index_id = p.index_id
+       AND ic.index_column_id = seg.column_id
+    JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.columns AS c
+        ON c.[object_id] = ic.[object_id]
+       AND c.column_id = ic.column_id
+    JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.types AS t
+        ON c.system_type_id = t.system_type_id
+       AND t.user_type_id = t.system_type_id
+    WHERE i.type IN (5, 6)
+      AND seg.row_count > 0
+      AND seg.min_deep_data IS NULL
+      AND seg.max_deep_data IS NULL
+      AND (
+              (t.name IN (N''char'', N''varchar'', N''nchar'', N''nvarchar'', N''binary'', N''varbinary'') AND c.max_length <> -1)
+           OR  t.name = N''uniqueidentifier''
+           OR (t.name = N''datetimeoffset'' AND c.scale > 2)
+          )' + CASE WHEN @ObjectID IS NOT NULL
+                    THEN N'
+      AND p.[object_id] = ' + CAST(@ObjectID AS NVARCHAR(30))
+                    ELSE N'' END + N'
+)
+SELECT
+    ' + CAST(@DatabaseID AS NVARCHAR(16)) + N',
+    e.[object_id],
+    e.index_id,
+    STUFF((SELECT N'', '' + e2.column_name
+             FROM eligible AS e2
+            WHERE e2.[object_id] = e.[object_id]
+              AND e2.index_id    = e.index_id
+            ORDER BY e2.column_id
+            FOR XML PATH(N''''), TYPE).value(N''.'', N''NVARCHAR(MAX)''), 1, 2, N'''') AS eligible_columns
+FROM eligible AS e
+GROUP BY e.[object_id], e.index_id
+OPTION (RECOMPILE);';
+
+            BEGIN TRY
+                RAISERROR (N'Inserting data into #ColumnstoreIndexesNeedingRebuild', 0, 1) WITH NOWAIT;
+                INSERT #ColumnstoreIndexesNeedingRebuild (database_id, [object_id], index_id, eligible_columns)
+                EXEC sp_executesql @dsql;
+            END TRY
+            BEGIN CATCH
+                RAISERROR (N'Skipping #ColumnstoreIndexesNeedingRebuild population due to error, typically low permissions, an inaccessible database, or another metadata/query issue', 0, 1) WITH NOWAIT;
+            END CATCH;
+        END;
+
 
     END;
 			
@@ -3455,6 +3597,7 @@ BEGIN
             s.last_user_update,
             s.create_date,
             s.modify_date,
+            s.optimize_for_sequential_key,
 			sz.page_latch_wait_count,
 			CONVERT(VARCHAR(10), (sz.page_latch_wait_in_ms / 1000) / 86400) + ':' + CONVERT(VARCHAR(20), DATEADD(s, (sz.page_latch_wait_in_ms / 1000), 0), 108) AS page_latch_wait_time,
 			sz.page_io_latch_wait_count,
@@ -3487,7 +3630,7 @@ BEGIN
                 N'SQL Server First Responder Kit' ,   
                 N'http://FirstResponderKit.org' ,
                 N'From Your Community Volunteers',
-                NULL,@DaysUptimeInsertValue,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                NULL,@DaysUptimeInsertValue,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
                 0 AS display_order
     )
     SELECT 
@@ -3509,9 +3652,10 @@ BEGIN
             create_date AS [Created],
             modify_date AS [Last Modified],
 			page_latch_wait_count AS [Page Latch Wait Count],
-			page_latch_wait_time as [Page Latch Wait Time (D:H:M:S)],
+			page_latch_wait_time AS [Page Latch Wait Time (D:H:M:S)],
+            optimize_for_sequential_key AS [Optimized For Sequential Key?],
 			page_io_latch_wait_count AS [Page IO Latch Wait Count],								
-			page_io_latch_wait_time as [Page IO Latch Wait Time (D:H:M:S)],
+			page_io_latch_wait_time AS [Page IO Latch Wait Time (D:H:M:S)],
             create_tsql AS [Create TSQL],
             drop_tsql AS [Drop TSQL]
     FROM table_mode_cte
@@ -3579,6 +3723,39 @@ BEGIN
         SET @CurrentAIPrompt = N'I need help analyzing the indexes on the table '
             + QUOTENAME(@DatabaseName) + N'.' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName)
             + N'.' + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10);
+
+        /* Tell the AI which version and edition we're on, then list only the
+           low-impact index options that ARE available on this server, so it
+           can use them in CREATE INDEX / ALTER INDEX scripts without having
+           to apply availability rules itself. */
+        SET @CurrentAIPrompt = @CurrentAIPrompt + N'SERVER VERSION AND EDITION:' + CHAR(13) + CHAR(10)
+            + N'This database is running on ' + @SQLServerVersionDescription
+            + N' (build ' + ISNULL(@SQLServerProductVersion, N'unknown')
+            + N', EngineEdition ' + ISNULL(CAST(@SQLServerEdition AS NVARCHAR(10)), N'unknown') + N').' + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10);
+
+        SET @CurrentAIPrompt = @CurrentAIPrompt + N'INDEX OPTIONS AVAILABLE ON THIS SERVER (use these where appropriate in CREATE INDEX and ALTER INDEX scripts):' + CHAR(13) + CHAR(10);
+
+        /* ONLINE + WAIT_AT_LOW_PRIORITY: Enterprise/Developer (engine edition 3) and the Azure variants. */
+        IF @SQLServerEdition IN (3, 5, 8, 9)
+            SET @CurrentAIPrompt = @CurrentAIPrompt
+                + N'- ONLINE = ON to avoid blocking writers during index changes.' + CHAR(13) + CHAR(10)
+                + N'- WAIT_AT_LOW_PRIORITY (MAX_DURATION = N MINUTES, ABORT_AFTER_WAIT = SELF) combined with ONLINE = ON to reduce blocking impact on busy systems.' + CHAR(13) + CHAR(10);
+        ELSE
+            SET @CurrentAIPrompt = @CurrentAIPrompt
+                + N'- This edition does not support ONLINE index operations or WAIT_AT_LOW_PRIORITY. Schedule index changes for a maintenance window.' + CHAR(13) + CHAR(10);
+
+        /* RESUMABLE: Azure variants always; Enterprise/Developer 2019+ for both CREATE and REBUILD; 2017 only for REBUILD. */
+        IF @SQLServerEdition IN (5, 8, 9)
+            OR (@SQLServerEdition = 3 AND @SQLServerProductVersionMajor >= 15)
+            SET @CurrentAIPrompt = @CurrentAIPrompt + N'- RESUMABLE = ON on online CREATE INDEX and online ALTER INDEX REBUILD so operations can be paused and resumed.' + CHAR(13) + CHAR(10);
+        ELSE IF @SQLServerEdition = 3 AND @SQLServerProductVersionMajor = 14
+            SET @CurrentAIPrompt = @CurrentAIPrompt + N'- RESUMABLE = ON on online ALTER INDEX REBUILD so the operation can be paused and resumed.' + CHAR(13) + CHAR(10);
+
+        /* OPTIMIZE_FOR_SEQUENTIAL_KEY: SQL 2019+ all editions, plus Azure variants. */
+        IF @SQLServerEdition IN (5, 8, 9) OR @SQLServerProductVersionMajor >= 15
+            SET @CurrentAIPrompt = @CurrentAIPrompt + N'- OPTIMIZE_FOR_SEQUENTIAL_KEY = ON for indexes whose leading key column is a hot ascending value (identity, sequence, current datetime) to relieve last-page insert contention.' + CHAR(13) + CHAR(10);
+
+        SET @CurrentAIPrompt = @CurrentAIPrompt + CHAR(13) + CHAR(10);
 
         /* Prepend constitution if found */
         IF @ai_constitution IS NOT NULL AND LEN(@ai_constitution) > 0
@@ -3904,6 +4081,30 @@ BEGIN
     BEGIN
         RAISERROR(N'Visualizing columnstore index contents.', 0,1) WITH NOWAIT;
 
+        /*
+        Decode the segment min/max into something readable for the visualizer
+        instead of the raw dictionary IDs in min_data_id / max_data_id.
+
+        DATE / DATETIME / DATETIME2 / SMALLDATETIME pack the value into the
+        BIGINT min_data_id and decode on every supported version:
+            DATE          : days since 0001-01-01
+            SMALLDATETIME : days * 65536 + minutes-since-midnight
+            DATETIME      : days * 2^32 + ticks (1/300 sec since midnight)
+            DATETIME2     : days * 2^40 + 100ns-ticks-since-midnight
+
+        SQL Server 2022+ / Azure SQL DB / MI added min_deep_data and
+        max_deep_data, which hold the actual bytes of the segment min/max
+        for strings, uniqueidentifiers, and datetimeoffset(scale>2). When
+        they are populated, decode them into GUIDs / strings / dates here.
+
+        See https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/3966
+        */
+        DECLARE @HasDeepData BIT = 0;
+        IF EXISTS (SELECT 1 FROM sys.all_columns
+                   WHERE object_id = OBJECT_ID('sys.column_store_segments')
+                     AND name = 'min_deep_data')
+            SET @HasDeepData = 1;
+
 		SET @dsql = N'USE ' + QUOTENAME(@DatabaseName) + N'; 
 			IF EXISTS(SELECT * FROM ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_row_groups WHERE object_id = @ObjectID)
 				BEGIN
@@ -3974,7 +4175,73 @@ BEGIN
 					FROM (
 						SELECT c.name AS column_name, p.partition_number, rg.row_group_id, rg.total_rows, rg.deleted_rows,
                             phys.state_desc, phys.trim_reason_desc, phys.transition_to_compressed_state_desc, phys.has_vertipaq_optimization,
-							details = CAST(seg.min_data_id AS VARCHAR(20)) + '' to '' + CAST(seg.max_data_id AS VARCHAR(20)) + '', '' + CAST(CAST(((COALESCE(d.on_disk_size,0) + COALESCE(seg.on_disk_size,0)) / 1024.0 / 1024) AS DECIMAL(18,0)) AS VARCHAR(20)) + '' MB''' 
+							details = COALESCE(CASE
+								/* DATE: min_data_id is days since 0001-01-01 on every supported version. */
+								WHEN c.system_type_id = 40 THEN
+									CONVERT(VARCHAR(10), DATEADD(DAY, CAST(seg.min_data_id AS INT), CONVERT(DATE, ''0001-01-01'')), 23)
+									+ '' to ''
+									+ CONVERT(VARCHAR(10), DATEADD(DAY, CAST(seg.max_data_id AS INT), CONVERT(DATE, ''0001-01-01'')), 23)
+								/* SMALLDATETIME: BIGINT = days * 65536 + minutes; days are since 1900-01-01. */
+								WHEN c.system_type_id = 58 THEN
+									CONVERT(VARCHAR(10), DATEADD(DAY, CAST(seg.min_data_id / 65536 AS INT), CONVERT(DATE, ''1900-01-01'')), 23)
+									+ '' to ''
+									+ CONVERT(VARCHAR(10), DATEADD(DAY, CAST(seg.max_data_id / 65536 AS INT), CONVERT(DATE, ''1900-01-01'')), 23)
+								/* DATETIME: BIGINT = days * 2^32 + ticks (1/300 sec); days are since 1900-01-01.
+								   T-SQL integer division truncates toward zero, so for negative
+								   values (pre-1900 dates) with non-zero ticks we have to nudge
+								   toward negative infinity to get the right calendar day. */
+								WHEN c.system_type_id = 61 THEN
+									CONVERT(VARCHAR(10), DATEADD(DAY, CAST(CASE
+										WHEN seg.min_data_id < 0 AND seg.min_data_id % 4294967296 <> 0 THEN (seg.min_data_id / 4294967296) - 1
+										ELSE seg.min_data_id / 4294967296
+									END AS INT), CONVERT(DATE, ''1900-01-01'')), 23)
+									+ '' to ''
+									+ CONVERT(VARCHAR(10), DATEADD(DAY, CAST(CASE
+										WHEN seg.max_data_id < 0 AND seg.max_data_id % 4294967296 <> 0 THEN (seg.max_data_id / 4294967296) - 1
+										ELSE seg.max_data_id / 4294967296
+									END AS INT), CONVERT(DATE, ''1900-01-01'')), 23)
+								/* DATETIME2: BIGINT = days * 2^40 + ticks_100ns; days are since 0001-01-01. */
+								WHEN c.system_type_id = 42 THEN
+									CONVERT(VARCHAR(10), DATEADD(DAY, CAST(seg.min_data_id / 1099511627776 AS INT), CONVERT(DATE, ''0001-01-01'')), 23)
+									+ '' to ''
+									+ CONVERT(VARCHAR(10), DATEADD(DAY, CAST(seg.max_data_id / 1099511627776 AS INT), CONVERT(DATE, ''0001-01-01'')), 23)' +
+							CASE WHEN @HasDeepData = 1 THEN N'
+								/* UNIQUEIDENTIFIER: deep_data is a 2-byte length prefix (0x10 0x00) followed by the 16-byte GUID. */
+								WHEN c.system_type_id = 36 AND seg.min_deep_data IS NOT NULL THEN
+									CONVERT(VARCHAR(36), TRY_CAST(SUBSTRING(seg.min_deep_data, 3, 16) AS UNIQUEIDENTIFIER))
+									+ '' to ''
+									+ CONVERT(VARCHAR(36), TRY_CAST(SUBSTRING(seg.max_deep_data, 3, 16) AS UNIQUEIDENTIFIER))
+								/* DATETIMEOFFSET: deep_data is [2-byte length][time bytes][3-byte date][2-byte offset].
+								   Time width depends on scale: 3 bytes for scale 0-2, 4 bytes for 3-4, 5 bytes for 5-7.
+								   Date is 3 little-endian bytes of days since 0001-01-01. */
+								WHEN c.system_type_id = 43 AND seg.min_deep_data IS NOT NULL THEN
+									CONVERT(VARCHAR(10), DATEADD(DAY,
+										CAST(SUBSTRING(seg.min_deep_data, 3 + (CASE WHEN c.scale <= 2 THEN 3 WHEN c.scale <= 4 THEN 4 ELSE 5 END), 1) AS INT)
+										+ 256 * CAST(SUBSTRING(seg.min_deep_data, 4 + (CASE WHEN c.scale <= 2 THEN 3 WHEN c.scale <= 4 THEN 4 ELSE 5 END), 1) AS INT)
+										+ 65536 * CAST(SUBSTRING(seg.min_deep_data, 5 + (CASE WHEN c.scale <= 2 THEN 3 WHEN c.scale <= 4 THEN 4 ELSE 5 END), 1) AS INT),
+										CONVERT(DATE, ''0001-01-01'')), 23)
+									+ '' to ''
+									+ CONVERT(VARCHAR(10), DATEADD(DAY,
+										CAST(SUBSTRING(seg.max_deep_data, 3 + (CASE WHEN c.scale <= 2 THEN 3 WHEN c.scale <= 4 THEN 4 ELSE 5 END), 1) AS INT)
+										+ 256 * CAST(SUBSTRING(seg.max_deep_data, 4 + (CASE WHEN c.scale <= 2 THEN 3 WHEN c.scale <= 4 THEN 4 ELSE 5 END), 1) AS INT)
+										+ 65536 * CAST(SUBSTRING(seg.max_deep_data, 5 + (CASE WHEN c.scale <= 2 THEN 3 WHEN c.scale <= 4 THEN 4 ELSE 5 END), 1) AS INT),
+										CONVERT(DATE, ''0001-01-01'')), 23)
+								/* CHAR / VARCHAR: 2-byte little-endian length prefix, then the (possibly sort-key encoded) bytes; truncate for display. */
+								WHEN c.system_type_id IN (167, 175) AND seg.min_deep_data IS NOT NULL THEN
+									LEFT(TRY_CAST(SUBSTRING(seg.min_deep_data, 3, 898) AS VARCHAR(900)), 30)
+									+ '' to ''
+									+ LEFT(TRY_CAST(SUBSTRING(seg.max_deep_data, 3, 898) AS VARCHAR(900)), 30)
+								/* NCHAR / NVARCHAR: 2-byte length prefix, then UTF-16LE bytes. */
+								WHEN c.system_type_id IN (231, 239) AND seg.min_deep_data IS NOT NULL THEN
+									LEFT(TRY_CAST(SUBSTRING(seg.min_deep_data, 3, 898) AS NVARCHAR(450)), 30)
+									+ '' to ''
+									+ LEFT(TRY_CAST(SUBSTRING(seg.max_deep_data, 3, 898) AS NVARCHAR(450)), 30)' ELSE N'' END +
+							N'
+								ELSE NULL
+							END,
+							/* Fall back to raw min/max_data_id for numeric types and anything we could not decode. */
+							CAST(seg.min_data_id AS VARCHAR(20)) + '' to '' + CAST(seg.max_data_id AS VARCHAR(20)))
+							+ '', '' + CAST(CAST(((COALESCE(d.on_disk_size,0) + COALESCE(seg.on_disk_size,0)) / 1024.0 / 1024) AS DECIMAL(18,0)) AS VARCHAR(20)) + '' MB'''
 							+ CASE WHEN @ShowPartitionRanges = 1 THEN N',
 							CASE
 								WHEN pp.system_type_id IN (40, 41, 42, 43, 58, 61) THEN 126
@@ -4272,9 +4539,10 @@ BEGIN
                                 di.database_id = ip.database_id AND
                                 di.first_key_column_name = ip.first_key_column_name AND
                                 di.key_column_names <> ip.key_column_names AND
-                                di.number_dupes > 1    
+                                di.number_dupes > 1
                         )
-						AND ip.is_primary_key = 0                                          
+						AND ip.is_primary_key = 0
+                        AND ips.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ips.total_reserved_MB END
                         ORDER BY ips.total_rows DESC, ip.[schema_name], ip.[object_name], ip.key_column_names, ip.include_column_names
             OPTION    ( RECOMPILE );
 
@@ -4424,6 +4692,7 @@ BEGIN
                 FROM    #IndexSanity AS i
                 JOIN #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
                 WHERE    (total_row_lock_wait_in_ms + total_page_lock_wait_in_ms) > 300000
+                AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 				GROUP BY i.index_sanity_id, [database_name], i.db_schema_object_indexid, sz.index_lock_wait_summary, i.index_definition, i.secret_columns, i.index_usage_summary, sz.index_size_summary, sz.index_sanity_id
                 ORDER BY SUM(total_row_lock_wait_in_ms + total_page_lock_wait_in_ms) DESC, 4, [database_name], 8
                 OPTION    ( RECOMPILE );
@@ -4458,9 +4727,10 @@ BEGIN
                         FROM    #IndexSanity i
                         JOIN #IndexSanitySize ip ON i.index_sanity_id = ip.index_sanity_id
                         WHERE    index_id NOT IN ( 0, 1 )
+                        AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         GROUP BY db_schema_object_name, [i].[database_name]
                         HAVING    COUNT(*) >= 10
-                        ORDER BY i.db_schema_object_name DESC  
+                        ORDER BY i.db_schema_object_name DESC
 						OPTION    ( RECOMPILE );
 
                 RAISERROR(N'check_id 22: NC indexes with 0 reads and >= 10,000 writes', 0,1) WITH NOWAIT;
@@ -4523,6 +4793,7 @@ BEGIN
                         FROM    #IndexSanity i
                         JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                         WHERE   i.filter_columns_not_in_index IS NOT NULL
+                        AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                         ORDER BY i.db_schema_object_indexid
                         OPTION    ( RECOMPILE );
 
@@ -4554,6 +4825,7 @@ BEGIN
                         AND i.[database_id] = hist.[database_id]
                         WHERE hist.history_table_object_id IS NOT NULL
                         AND i.index_type = 2 /* NC only */
+                        AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                         ORDER BY i.db_schema_object_indexid
                         OPTION    ( RECOMPILE );
 
@@ -4586,7 +4858,9 @@ BEGIN
                     FROM    #IndexSanity AS i
                     JOIN    #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
                     WHERE    index_id > 1
-                    AND    fill_factor BETWEEN 1 AND 80 OPTION    ( RECOMPILE );
+                    AND    fill_factor BETWEEN 1 AND 80
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
+                    OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 40: Fillfactor in clustered 80 percent or less', 0,1) WITH NOWAIT;
                 INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
@@ -4613,7 +4887,9 @@ BEGIN
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
                     WHERE    index_id = 1
-                    AND fill_factor BETWEEN 1 AND 80 OPTION    ( RECOMPILE );
+                    AND fill_factor BETWEEN 1 AND 80
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
+                    OPTION    ( RECOMPILE );
 
 
             RAISERROR(N'check_id 43: Heaps with forwarded records', 0,1) WITH NOWAIT;
@@ -4655,7 +4931,7 @@ BEGIN
                         JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                         WHERE    i.index_id = 0 
                         AND h.forwarded_fetch_count / @DaysUptime > 1000
-                        AND sz.total_reserved_MB >= CASE WHEN NOT (@GetAllDatabases = 1 OR @Mode = 4) THEN @ThresholdMB ELSE sz.total_reserved_MB END
+                        AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                 OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 44: Large Heaps with reads or writes.', 0,1) WITH NOWAIT;
@@ -4692,7 +4968,7 @@ BEGIN
                         JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                         WHERE    i.index_id = 0 
                                 AND (i.total_reads > 0 OR i.user_updates > 0)
-								AND sz.total_rows >= 100000
+								AND sz.total_reserved_MB > 10240
                                 AND h.[object_id] IS NULL /*don't duplicate the prior check.*/
                 OPTION    ( RECOMPILE );
 
@@ -4731,7 +5007,7 @@ BEGIN
                         WHERE    i.index_id = 0 
                                 AND 
                                     (i.total_reads > 0 OR i.user_updates > 0)
-								AND sz.total_rows >= 10000 AND sz.total_rows < 100000
+								AND sz.total_reserved_MB >= 1024 AND sz.total_reserved_MB <= 10240
                                 AND h.[object_id] IS NULL /*don't duplicate the prior check.*/
                 OPTION    ( RECOMPILE );
 
@@ -4770,7 +5046,7 @@ BEGIN
                         WHERE    i.index_id = 0 
                                 AND 
                                     (i.total_reads > 0 OR i.user_updates > 0)
-								AND sz.total_rows < 10000
+								AND sz.total_reserved_MB >= 1 AND sz.total_reserved_MB < 1024
                                 AND h.[object_id] IS NULL /*don't duplicate the prior check.*/
 						OPTION    ( RECOMPILE );
 
@@ -4800,6 +5076,7 @@ BEGIN
                               AND   i.object_id = isa.object_id
                               AND   isa.index_id = 0
                             )
+                        AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 						OPTION    ( RECOMPILE );
 
 
@@ -4820,9 +5097,10 @@ BEGIN
                                 sz.index_size_summary
                         FROM    #IndexSanity i
                         JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                        WHERE    i.index_id = 0 
+                        WHERE    i.index_id = 0
                                 AND (i.total_reads > 0 OR i.user_updates > 0) /*it doesn't matter that much if it's not active*/
 								AND sz.data_compression_desc LIKE '%PAGE%' /*using LIKE here because there are some variations for this value*/
+                                AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                 OPTION    ( RECOMPILE );
 
 	            RAISERROR(N'check_id 48: Nonclustered indexes with a bad read to write ratio', 0,1) WITH NOWAIT;
@@ -4997,6 +5275,7 @@ BEGIN
                                 ) AS calc1
                         WHERE    i.index_id IN (1,0)
                             AND calc1.percent_remaining <= 30
+                            AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         OPTION (RECOMPILE);
 
 
@@ -5021,8 +5300,41 @@ BEGIN
                 FROM    #IndexSanity AS i
                 JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                 WHERE i.index_type IN (5,6)
+                AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                 OPTION    ( RECOMPILE );
 			END;
+
+		RAISERROR(N'check_id 130: Columnstore Index Needs to Be Rebuilt for predicate pushdown', 0,1) WITH NOWAIT;
+            IF EXISTS (SELECT 1 FROM #ColumnstoreIndexesNeedingRebuild)
+            BEGIN
+                INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
+                                                secret_columns, index_usage_summary, index_size_summary )
+                SELECT  130 AS check_id,
+                        i.index_sanity_id,
+                        100 AS Priority,
+                        N'Indexes Worth Reviewing' AS findings_group,
+                        N'Columnstore Index Needs to Be Rebuilt' AS finding,
+                        i.[database_name] AS [Database Name],
+                        N'https://learn.microsoft.com/en-us/sql/relational-databases/indexes/columnstore-indexes-what-s-new?view=sql-server-ver17' AS URL,
+                        i.db_schema_object_indexid
+                            + N'. SQL Server 2022 added segment elimination for string, binary, uniqueidentifier, and datetimeoffset(scale > 2) columns, but the columnstore segments for this index do not have min_deep_data / max_deep_data populated for: '
+                            + cs.eligible_columns
+                            + N'. Rebuild with ALTER INDEX REBUILD or CREATE INDEX WITH (DROP_EXISTING = ON) so queries on those columns can take advantage of predicate pushdown.' AS details,
+                        i.index_definition,
+                        i.secret_columns,
+                        i.index_usage_summary,
+                        ISNULL(sz.index_size_summary, '') AS index_size_summary
+                FROM    #IndexSanity AS i
+                JOIN    #IndexSanitySize AS sz
+                    ON  i.index_sanity_id = sz.index_sanity_id
+                JOIN    #ColumnstoreIndexesNeedingRebuild AS cs
+                    ON  cs.database_id = i.database_id
+                    AND cs.[object_id] = i.[object_id]
+                    AND cs.index_id    = i.index_id
+                WHERE   i.index_type IN (5, 6)
+                AND     sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
+                OPTION (RECOMPILE);
+            END;
 
         ----------------------------------------
         --Statistics Info: Check_id 90-99, as well as 125
@@ -5182,60 +5494,53 @@ BEGIN
         RAISERROR(N'@Mode=4, running rules for priorities 101+.', 0,1) WITH NOWAIT;
 
             RAISERROR(N'check_id 21: More Than 5 Percent NC Indexes Are Unused', 0,1) WITH NOWAIT;
-            DECLARE @percent_NC_indexes_unused NUMERIC(29,1);
-            DECLARE @NC_indexes_unused_reserved_MB NUMERIC(29,1);
-
-            SELECT  @percent_NC_indexes_unused = ( 100.00 * SUM(CASE 
-					                                                WHEN total_reads = 0 
-																	THEN 1
-                                                                    ELSE 0
-                                                                    END) ) / COUNT(*),
-                    @NC_indexes_unused_reserved_MB = SUM(CASE 
-							                                    WHEN total_reads = 0 
-																THEN sz.total_reserved_MB
-                                                                ELSE 0
-                                                            END) 
-            FROM    #IndexSanity i
-            JOIN    #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-            WHERE    index_id NOT IN ( 0, 1 ) 
-                    AND i.is_unique = 0
-                    /*Skipping tables created in the last week, or modified in past 2 days*/
-                    AND	i.create_date < DATEADD(dd,-7,GETDATE()) 
-                    AND i.modify_date < DATEADD(dd,-2,GETDATE()) 
-            OPTION    ( RECOMPILE );
-            IF @percent_NC_indexes_unused >= 5 
             INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
                                             secret_columns, index_usage_summary, index_size_summary )
-                        SELECT  21 AS check_id, 
-                                MAX(i.index_sanity_id) AS index_sanity_id, 
+                        SELECT  21 AS check_id,
+                                MAX(i.index_sanity_id) AS index_sanity_id,
                                 150 AS Priority,
                                 N'Over-Indexing' AS findings_group,
                                 N'More Than 5 Percent NC Indexes Are Unused' AS finding,
-                                [database_name] AS [Database Name],
+                                i.[database_name] AS [Database Name],
                                 N'https://www.brentozar.com/go/IndexHoarder' AS URL,
-                                CAST (@percent_NC_indexes_unused AS NVARCHAR(30)) + N' percent NC indexes (' + CAST(COUNT(*) AS NVARCHAR(10)) + N') unused. ' +
-                                N'These take up ' + CAST (@NC_indexes_unused_reserved_MB AS NVARCHAR(30)) + N'MB of space.' AS details,
+                                CAST (MAX(perc.percent_NC_indexes_unused) AS NVARCHAR(30)) + N' percent NC indexes (' + CAST(COUNT(*) AS NVARCHAR(10)) + N') unused. ' +
+                                N'These take up ' + CAST (MAX(perc.NC_indexes_unused_reserved_MB) AS NVARCHAR(30)) + N'MB of space.' AS details,
                                 i.database_name + ' (' + CAST (COUNT(*) AS NVARCHAR(30)) + N' indexes)' AS index_definition,
-                                '' AS secret_columns, 
-                                CAST(SUM(total_reads) AS NVARCHAR(256)) + N' reads (ALL); '
-                                    + CAST(SUM([user_updates]) AS NVARCHAR(256)) + N' writes (ALL)' AS index_usage_summary,
-                                
-                                REPLACE(CONVERT(NVARCHAR(30),CAST(MAX([total_rows]) AS MONEY), 1), '.00', '') + N' rows (MAX)'
-                                    + CASE WHEN SUM(total_reserved_MB) > 1024 THEN 
-                                        N'; ' + CAST(CAST(SUM(total_reserved_MB)/1024. AS NUMERIC(29,1)) AS NVARCHAR(30)) + 'GB (ALL)'
-                                    WHEN SUM(total_reserved_MB) > 0 THEN
-                                        N'; ' + CAST(CAST(SUM(total_reserved_MB) AS NUMERIC(29,1)) AS NVARCHAR(30)) + 'MB (ALL)'
+                                '' AS secret_columns,
+                                CAST(SUM(i.total_reads) AS NVARCHAR(256)) + N' reads (ALL); '
+                                    + CAST(SUM(i.[user_updates]) AS NVARCHAR(256)) + N' writes (ALL)' AS index_usage_summary,
+
+                                REPLACE(CONVERT(NVARCHAR(30),CAST(MAX(sz.[total_rows]) AS MONEY), 1), '.00', '') + N' rows (MAX)'
+                                    + CASE WHEN SUM(sz.total_reserved_MB) > 1024 THEN
+                                        N'; ' + CAST(CAST(SUM(sz.total_reserved_MB)/1024. AS NUMERIC(29,1)) AS NVARCHAR(30)) + 'GB (ALL)'
+                                    WHEN SUM(sz.total_reserved_MB) > 0 THEN
+                                        N'; ' + CAST(CAST(SUM(sz.total_reserved_MB) AS NUMERIC(29,1)) AS NVARCHAR(30)) + 'MB (ALL)'
                                     ELSE ''
                                     END AS index_size_summary
                         FROM    #IndexSanity i
                         JOIN    #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                        WHERE    index_id NOT IN ( 0, 1 )
+                        JOIN (
+                                SELECT  i.database_name,
+                                        CAST((100.00 * SUM(CASE WHEN i.total_reads = 0 THEN 1 ELSE 0 END)) / COUNT(*) AS NUMERIC(29,1)) AS percent_NC_indexes_unused,
+                                        CAST(SUM(CASE WHEN i.total_reads = 0 THEN sz.total_reserved_MB ELSE 0 END) AS NUMERIC(29,1)) AS NC_indexes_unused_reserved_MB
+                                FROM    #IndexSanity i
+                                JOIN    #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
+                                WHERE   i.index_id NOT IN ( 0, 1 )
+                                        AND i.is_unique = 0
+                                        /*Skipping tables created in the last week, or modified in past 2 days*/
+                                        AND i.create_date < DATEADD(dd,-7,GETDATE())
+                                        AND i.modify_date < DATEADD(dd,-2,GETDATE())
+                                GROUP BY i.database_name
+                             ) AS perc ON i.database_name = perc.database_name
+                        WHERE    i.index_id NOT IN ( 0, 1 )
                                 AND i.is_unique = 0
-                                AND total_reads = 0
+                                AND i.total_reads = 0
                                 /*Skipping tables created in the last week, or modified in past 2 days*/
-                                AND	i.create_date < DATEADD(dd,-7,GETDATE()) 
+                                AND	i.create_date < DATEADD(dd,-7,GETDATE())
                                 AND i.modify_date < DATEADD(dd,-2,GETDATE())
-                        GROUP BY i.database_name 
+                                AND perc.percent_NC_indexes_unused >= 5
+                                AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
+                        GROUP BY i.database_name
                 OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 23: Indexes with 7 or more columns. (Borderline)', 0,1) WITH NOWAIT;
@@ -5256,6 +5561,7 @@ BEGIN
                     FROM    #IndexSanity AS i
                     JOIN    #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
                     WHERE    ( count_key_columns + count_included_columns ) >= 7
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                     OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 24: Wide clustered indexes (> 3 columns or > 16 bytes).', 0,1) WITH NOWAIT;
@@ -5298,10 +5604,11 @@ BEGIN
                         JOIN    count_columns AS cc ON i.[object_id]=cc.[object_id]
                                                    AND i.database_id = cc.database_id
                         WHERE    index_id = 1 /* clustered only */
-                                AND 
+                                AND
                                     (count_key_columns > 3 /*More than three key columns.*/
                                     OR cc.sum_max_length > 16 /*More than 16 bytes in key */)
 									AND i.is_CX_columnstore = 0
+                                AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         ORDER BY i.db_schema_object_name DESC OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 25: High ratio of nullable columns.', 0,1) WITH NOWAIT;
@@ -5342,6 +5649,8 @@ BEGIN
                         WHERE    i.index_id IN (1,0)
                             AND cc.non_nullable_columns < 2
                             AND cc.total_columns > 3
+                            AND ip.total_rows > 0
+                            AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         ORDER BY i.db_schema_object_name DESC OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 26: Wide tables (35+ cols or > 2000 non-LOB bytes).', 0,1) WITH NOWAIT;
@@ -5385,9 +5694,10 @@ BEGIN
 								AND cc.database_id = i.database_id
 								AND cc.[schema_name] = i.[schema_name]
                         WHERE    i.index_id IN (1,0)
-                            AND 
+                            AND
                             (cc.total_columns >= 35 OR
                             cc.sum_max_length >= 2000)
+                            AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         ORDER BY i.db_schema_object_name DESC OPTION    ( RECOMPILE );
                     
             RAISERROR(N'check_id 27: High Ratio of Strings.', 0,1) WITH NOWAIT;
@@ -5429,6 +5739,7 @@ BEGIN
                         WHERE    i.index_id IN (1,0)
                             AND calc1.non_string_or_lob_columns <= 1
                             AND cc.total_columns > 3
+                            AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         ORDER BY i.db_schema_object_name DESC OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 28: Non-unique clustered index.', 0,1) WITH NOWAIT;
@@ -5461,6 +5772,7 @@ BEGIN
                         WHERE    index_id = 1 /* clustered only */
                                 AND is_unique=0 /* not unique */
                                 AND is_CX_columnstore=0 /* not a clustered columnstore-- no unique option on those */
+                                AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         ORDER BY i.db_schema_object_name DESC OPTION    ( RECOMPILE );
 
         RAISERROR(N'check_id 29: NC indexes with 0 reads and < 10,000 writes', 0,1) WITH NOWAIT;
@@ -5600,6 +5912,7 @@ BEGIN
 					    OR column_name LIKE '%archive%'
 					    OR column_name LIKE '%active%'
 					    OR column_name LIKE '%flag%')
+					AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 41: Hypothetical indexes ', 0,1) WITH NOWAIT;
@@ -5675,7 +5988,7 @@ BEGIN
 							 AND i.[schema_name] = h.[schema_name]
                         JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                         WHERE    i.index_id = 0 
-                        AND sz.total_reserved_MB >= CASE WHEN NOT (@GetAllDatabases = 1 OR @Mode = 4) THEN @ThresholdMB ELSE sz.total_reserved_MB END
+                        AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                 OPTION    ( RECOMPILE );
 
          ----------------------------------------
@@ -5698,7 +6011,8 @@ BEGIN
                             ISNULL(sz.index_size_summary,'') AS index_size_summary
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE i.is_XML = 1 
+                    WHERE i.is_XML = 1
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 61: Columnstore indexes', 0,1) WITH NOWAIT;
@@ -5721,7 +6035,8 @@ BEGIN
                             ISNULL(sz.index_size_summary,'') AS index_size_summary
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE i.is_NC_columnstore = 1 OR i.is_CX_columnstore=1
+                    WHERE (i.is_NC_columnstore = 1 OR i.is_CX_columnstore=1)
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                     OPTION    ( RECOMPILE );
 
 
@@ -5743,6 +6058,7 @@ BEGIN
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                     Where i.is_spatial = 1
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 129: JSON indexes', 0,1) WITH NOWAIT;
@@ -5763,6 +6079,7 @@ BEGIN
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                     WHERE i.is_json = 1
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 63: Compressed indexes', 0,1) WITH NOWAIT;
@@ -5782,7 +6099,8 @@ BEGIN
                             ISNULL(sz.index_size_summary,'') AS index_size_summary
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE sz.data_compression_desc LIKE '%PAGE%' OR sz.data_compression_desc LIKE '%ROW%' 
+                    WHERE (sz.data_compression_desc LIKE '%PAGE%' OR sz.data_compression_desc LIKE '%ROW%')
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 64: Partitioned', 0,1) WITH NOWAIT;
@@ -5802,7 +6120,8 @@ BEGIN
                             ISNULL(sz.index_size_summary,'') AS index_size_summary
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE i.partition_key_column_name IS NOT NULL 
+                    WHERE i.partition_key_column_name IS NOT NULL
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 65: Non-Aligned Partitioned', 0,1) WITH NOWAIT;
@@ -5828,7 +6147,8 @@ BEGIN
                         AND iParent.index_id IN (0,1) /* could be a partitioned heap or clustered table */
                         AND iParent.partition_key_column_name IS NOT NULL /* parent is partitioned*/         
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE i.partition_key_column_name IS NULL 
+                    WHERE i.partition_key_column_name IS NULL
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                     OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 66: Recently created tables/indexes (1 week)', 0,1) WITH NOWAIT;
@@ -5851,7 +6171,8 @@ BEGIN
                             ISNULL(sz.index_size_summary,'') AS index_size_summary
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE i.create_date >= DATEADD(dd,-7,GETDATE()) 
+                    WHERE i.create_date >= DATEADD(dd,-7,GETDATE())
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                     OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 67: Recently modified tables/indexes (2 days)', 0,1) WITH NOWAIT;
@@ -5874,9 +6195,10 @@ BEGIN
                             ISNULL(sz.index_size_summary,'') AS index_size_summary
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
-                    WHERE i.modify_date > DATEADD(dd,-2,GETDATE()) 
+                    WHERE i.modify_date > DATEADD(dd,-2,GETDATE())
                     AND /*Exclude recently created tables.*/
-                    i.create_date < DATEADD(dd,-7,GETDATE()) 
+                    i.create_date < DATEADD(dd,-7,GETDATE())
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
                     OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 69: Column collation does not match database collation', 0,1) WITH NOWAIT;
@@ -5916,6 +6238,7 @@ BEGIN
 								AND cc.database_id = i.database_id
 								AND cc.schema_name = i.schema_name
                         WHERE    i.index_id IN (1,0)
+                            AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
                         ORDER BY i.db_schema_object_name DESC OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 70: Replicated columns', 0,1) WITH NOWAIT;
@@ -5957,7 +6280,8 @@ BEGIN
 								AND i.schema_name = cc.schema_name
                         WHERE    i.index_id IN (1,0)
                             AND replicated_column_count > 0
-                        ORDER BY i.db_schema_object_name DESC 
+                            AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
+                        ORDER BY i.db_schema_object_name DESC
 						OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 71: Cascading updates or cascading deletes.', 0,1) WITH NOWAIT;
@@ -5986,6 +6310,14 @@ BEGIN
             FROM #ForeignKeys fk
             WHERE ([delete_referential_action_desc] <> N'NO_ACTION'
             OR [update_referential_action_desc] <> N'NO_ACTION')
+            AND EXISTS (
+                SELECT 1/0
+                FROM #IndexSanity i
+                WHERE i.object_id = fk.parent_object_id
+                AND i.database_id = fk.database_id
+                AND i.schema_name = fk.schema_name
+                AND i.user_updates > 0
+            )
 			OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 72: Unindexed foreign keys.', 0,1) WITH NOWAIT;
@@ -6009,6 +6341,14 @@ BEGIN
                     (SELECT TOP 1 more_info FROM #IndexSanity i WHERE i.object_id=fk.parent_object_id AND i.database_id = fk.database_id AND i.schema_name = fk.schema_name)
                         AS more_info
             FROM #UnindexedForeignKeys AS fk
+            WHERE EXISTS (
+                SELECT 1/0
+                FROM #IndexSanity i
+                WHERE i.object_id = fk.parent_object_id
+                    AND i.database_id = fk.database_id
+                    AND i.schema_name = fk.schema_name
+                    AND (ISNULL(i.user_seeks, 0) + ISNULL(i.user_scans, 0) + ISNULL(i.user_lookups, 0)) > 0
+            )
 			OPTION    ( RECOMPILE );
 
 
@@ -6030,6 +6370,7 @@ BEGIN
                     FROM    #IndexSanity AS i
                     JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
                     WHERE i.is_in_memory_oltp = 1
+                    AND sz.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE sz.total_reserved_MB END
 					OPTION    ( RECOMPILE );
 
         RAISERROR(N'check_id 74: Identity column with unusual seed', 0,1) WITH NOWAIT;
@@ -6071,7 +6412,8 @@ BEGIN
                     JOIN    #IndexSanitySize ip ON i.index_sanity_id = ip.index_sanity_id
                     WHERE    i.index_id IN (1,0)
                         AND (ic.seed_value < 0 OR ic.increment_value <> 1)
-                    ORDER BY finding, details DESC 
+                        AND ip.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE ip.total_reserved_MB END
+                    ORDER BY finding, details DESC
 					OPTION    ( RECOMPILE );
 
         ----------------------------------------
@@ -6105,6 +6447,7 @@ BEGIN
         FROM #IndexSanity i
         JOIN #IndexSanitySize iss ON i.index_sanity_id=iss.index_sanity_id
         WHERE ISNULL(i.user_scans,0) > 0
+        AND iss.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE iss.total_reserved_MB END
         ORDER BY  i.user_scans * iss.total_reserved_MB DESC
 		OPTION    ( RECOMPILE );
 
@@ -6136,6 +6479,7 @@ BEGIN
         FROM #IndexSanity i
         JOIN #IndexSanitySize iss ON i.index_sanity_id=iss.index_sanity_id
         WHERE (ISNULL(iss.total_range_scan_count,0)  > 0 OR ISNULL(iss.total_singleton_lookup_count,0) > 0)
+        AND iss.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE iss.total_reserved_MB END
         ORDER BY ((iss.total_range_scan_count + iss.total_singleton_lookup_count) * iss.total_reserved_MB) DESC
 		OPTION    ( RECOMPILE );
 
@@ -6203,21 +6547,24 @@ BEGIN
 
 		RAISERROR(N'check_id 121: Optimized For Sequential Keys.', 0,1) WITH NOWAIT;
         INSERT    #BlitzIndexResults ( check_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
-                                               secret_columns, index_usage_summary, index_size_summary )
+                                               secret_columns, index_usage_summary, index_size_summary, more_info )
 
 				SELECT  121 AS check_id, 
 				200 AS Priority,
 				'Specialized Indexes' AS findings_group,
 				'Optimized For Sequential Keys',
 				i.database_name,
-				'' AS URL,
-				'The table ' + QUOTENAME(i.schema_name) + '.' + QUOTENAME(i.object_name) + ' is optimized for sequential keys.' AS details,
-				'' AS index_definition,
-				'N/A' AS secret_columns,
-				'N/A' AS index_usage_summary,
-				'N/A' AS index_size_summary
+				'https://erikdarling.com/enabling-optimize-for-sequential-key/' AS URL,
+				N'The index ' + i.db_schema_object_indexid + N' is optimized for sequential keys.' AS details,
+                ISNULL(i.key_column_names_with_sort_order,'N/A') AS index_definition,
+                ISNULL(i.secret_columns,'') AS secret_columns,
+                i.index_usage_summary AS index_usage_summary,
+                iss.index_size_summary AS index_size_summary,
+                i.more_info
 		FROM #IndexSanity AS i
+        JOIN #IndexSanitySize iss ON i.index_sanity_id=iss.index_sanity_id
 		WHERE i.optimize_for_sequential_key = 1
+        AND iss.total_reserved_MB >= CASE WHEN (@GetAllDatabases = 1 OR @Mode = 0) THEN @ThresholdMB ELSE iss.total_reserved_MB END
 		OPTION    ( RECOMPILE );
 
 
@@ -6862,6 +7209,7 @@ BEGIN
 											[data_compression_desc] NVARCHAR(4000), 
 						                    [page_latch_wait_count] BIGINT,
 								            [page_latch_wait_in_ms] BIGINT,
+								            [optimize_for_sequential_key] BIT NULL,
 								            [page_io_latch_wait_count] BIGINT,								
 								            [page_io_latch_wait_in_ms] BIGINT,
 											[create_date] DATETIME, 
@@ -6964,6 +7312,7 @@ BEGIN
 											[data_compression_desc], 
 						                    [page_latch_wait_count],
 								            [page_latch_wait_in_ms],
+								            [optimize_for_sequential_key],
 								            [page_io_latch_wait_count],								
 								            [page_io_latch_wait_in_ms],
 											[create_date], 
@@ -7055,6 +7404,7 @@ BEGIN
 										sz.data_compression_desc AS [Data Compression],
 						                sz.page_latch_wait_count,
 								        sz.page_latch_wait_in_ms,
+								        i.optimize_for_sequential_key AS [Optimized For Sequential Key?],
 								        sz.page_io_latch_wait_count,								
 								        sz.page_io_latch_wait_in_ms,
 										i.create_date AS [Create Date],
@@ -7148,6 +7498,7 @@ BEGIN
 					sz.total_index_lock_promotion_count AS [Lock Escalations],
 					sz.page_latch_wait_count AS [Page Latch Wait Count],
 					sz.page_latch_wait_in_ms AS [Page Latch Wait ms],
+					i.optimize_for_sequential_key AS [Optimized For Sequential Key?],
 					sz.page_io_latch_wait_count AS [Page IO Latch Wait Count],								
 					sz.page_io_latch_wait_in_ms as [Page IO Latch Wait ms],
                     sz.total_forwarded_fetch_count AS [Forwarded Fetches],

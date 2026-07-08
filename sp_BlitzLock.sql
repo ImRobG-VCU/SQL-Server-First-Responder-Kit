@@ -32,7 +32,8 @@ ALTER PROCEDURE
     @OutputDatabaseName sysname = NULL,
     @OutputSchemaName sysname = N'dbo',      /*ditto as below*/
     @OutputTableName sysname = N'BlitzLock', /*put a standard here no need to check later in the script*/
-    @ExportToExcel bit = 0
+    @ExportToExcel bit = 0,
+    @SkipExecutionPlans bit = 0 /*skip the execution plans result set (still returns deadlocks + findings rollup)*/
 )
 WITH RECOMPILE
 AS
@@ -42,7 +43,7 @@ BEGIN
     SET XACT_ABORT OFF;
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-    SELECT @Version = '8.32', @VersionDate = '20260407';
+    SELECT @Version = '8.34', @VersionDate = '20260702';
 
     IF @VersionCheckMode = 1
     BEGIN
@@ -90,7 +91,7 @@ BEGIN
 
         @OutputSchemaName: Specify a schema name to output information to a specific Schema
 
-        @OutputTableName: Specify table name to to output information to a specific table
+        @OutputTableName: Specify table name to output information to a specific table
 
         /*Point at a table containing deadlock XML*/
         @TargetDatabaseName: The database that contains the table with deadlock report XML
@@ -103,7 +104,10 @@ BEGIN
        
         @TargetTimestampColumnName: The name of the datetime column for filtering by date range (optional)
 
-   
+        /*Output options*/
+        @SkipExecutionPlans: Set to 1 to skip the execution plans result set and return only the findings rollup
+
+
     To learn more, visit http://FirstResponderKit.org where you can download new
     versions for free, watch training videos on how it works, get more info on
     the findings, contribute your own code, and more.
@@ -619,7 +623,7 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
         ) /*If database is invalid raiserror and set bitcheck*/
         BEGIN
             RAISERROR('Database Name (%s) for output of table is invalid please, Output to Table will not be performed', 0, 1, @OutputDatabaseName) WITH NOWAIT;
-            SET @OutputDatabaseCheck = -1; /* -1 invalid/false, 0 = good/true */
+            SET @OutputDatabaseCheck = NULL; /* bit can't hold -1; NULL = invalid, 0 = valid, default 1 = no output db requested. See issue #4000. */
         END;
         ELSE
         BEGIN
@@ -2802,7 +2806,7 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
 
         RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-        /*Check 8 gives you more info queries for sp_BlitzCache & BlitzQueryStore*/
+        /*Check 8 gives you more info queries for sp_BlitzCache & sp_QuickieStore*/
         SET @d = CONVERT(varchar(40), GETDATE(), 109);
         RAISERROR('Check 8 more info part 1 BlitzCache %s', 0, 1, @d) WITH NOWAIT;
 
@@ -2887,7 +2891,7 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
         IF (@ProductVersionMajor >= 13 OR @Azure = 1)
         BEGIN
             SET @d = CONVERT(varchar(40), GETDATE(), 109);
-            RAISERROR('Check 8 more info part 2 BlitzQueryStore %s', 0, 1, @d) WITH NOWAIT;
+            RAISERROR('Check 8 more info part 2 sp_QuickieStore %s', 0, 1, @d) WITH NOWAIT;
 
             WITH
                 deadlock_stack AS
@@ -2919,12 +2923,24 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
                 dow.database_name,
                 object_name = ds.proc_name,
                 finding_group = N'More Info - Query',
+                /* sp_QuickieStore is Erik Darling's Query Store explorer; install it
+                   from https://erikdarling.com/sp_quickiestore/ if you don't already
+                   have it. sp_BlitzQueryStore (the prior FRK tool that lived here) is
+                   deprecated.
+
+                   Pull @database_name from dow.database_name (derived from
+                   dow.database_id at deadlock time) rather than ds.database_name
+                   (PARSENAME(ds.proc_name, 3)). PARSENAME returns NULL for any
+                   proc_name that isn't 3-part, and QUOTENAME(NULL, '''') would
+                   NULL out the whole finding via string concat. dow.database_name
+                   is already used 4 lines up for the output column, so this stays
+                   consistent. */
                 finding =
-                    N'EXECUTE sp_BlitzQueryStore ' +
-                    N'@DatabaseName = ' +
-                    QUOTENAME(ds.database_name, N'''') +
+                    N'EXECUTE sp_QuickieStore ' +
+                    N'@database_name = ' +
+                    QUOTENAME(dow.database_name, N'''') +
                     N', ' +
-                    N'@StoredProcName = ' +
+                    N'@procedure_name = ' +
                     QUOTENAME(ds.proc_only_name, N'''') +
                     N';'
             FROM deadlock_stack AS ds
@@ -3550,6 +3566,175 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
         FROM #deadlock_process AS dp
         WHERE dp.transaction_name = N'implicit_transaction'
         HAVING COUNT_BIG(DISTINCT dp.event_date) > 0
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 17 is top deadlock queries by involvement*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 17 top deadlock queries %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            top_frame AS
+        (
+            SELECT
+                ds.id,
+                ds.event_date,
+                ds.proc_name,
+                ds.sql_handle,
+                ds.stmtstart,
+                ds.stmtend,
+                rn =
+                    ROW_NUMBER() OVER
+                    (
+                        PARTITION BY
+                            ds.id,
+                            ds.event_date
+                        ORDER BY
+                            ds.stmtstart
+                    )
+            FROM #deadlock_stack AS ds
+            WHERE ds.sql_handle <> N'0x'
+            AND   ds.sql_handle <> N''
+            AND   ds.sql_handle IS NOT NULL
+        ),
+            deadlock_queries AS
+        (
+            SELECT
+                dp.database_name,
+                tf.sql_handle,
+                tf.stmtstart,
+                tf.stmtend,
+                tf.proc_name,
+                dp.event_date,
+                dp.is_victim,
+                inputbuf =
+                    dp.process_xml.value
+                    (
+                        '(//process/inputbuf/text())[1]',
+                        'nvarchar(256)'
+                    )
+            FROM top_frame AS tf
+            JOIN #deadlock_process AS dp
+              ON dp.id = tf.id
+              AND dp.event_date = tf.event_date
+            WHERE tf.rn = 1
+            AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+            AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+            AND (dp.client_app = @AppName OR @AppName IS NULL)
+            AND (dp.host_name = @HostName OR @HostName IS NULL)
+            AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding,
+            sort_order
+        )
+        SELECT
+            check_id = 17,
+            dq.database_name,
+            object_name =
+                LEFT
+                (
+                    REPLACE
+                    (
+                        REPLACE
+                        (
+                            CASE
+                                WHEN dq.proc_name <> N'adhoc'
+                                THEN dq.proc_name
+                                ELSE
+                                    ISNULL
+                                    (
+                                        MAX(dq.inputbuf),
+                                        N'[Unknown]'
+                                    )
+                            END,
+                            NCHAR(13),
+                            N' '
+                        ),
+                        NCHAR(10),
+                        N' '
+                    ),
+                    200
+                ),
+            finding_group = N'Top Deadlock Query',
+            finding =
+                N'This query was involved in ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dq.event_date)
+                ) +
+                N' deadlocks (victim ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    SUM
+                    (
+                        CONVERT(int, dq.is_victim)
+                    )
+                ) +
+                N' times, survived ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dq.event_date) -
+                    SUM
+                    (
+                        CONVERT(int, dq.is_victim)
+                    )
+                ) +
+                N' times), ' +
+                ISNULL
+                (
+                    CONVERT
+                    (
+                        nvarchar(10),
+                        CONVERT
+                        (
+                            decimal(5, 1),
+                            100.0 *
+                            COUNT_BIG(DISTINCT dq.event_date) /
+                            NULLIF
+                            (
+                                SUM
+                                (
+                                    COUNT_BIG(DISTINCT dq.event_date)
+                                ) OVER (),
+                                0
+                            )
+                        )
+                    ),
+                    N'0.0'
+                ) +
+                N'% of total.',
+            sort_order =
+                ROW_NUMBER() OVER
+                (
+                    ORDER BY
+                        COUNT_BIG(DISTINCT dq.event_date) DESC
+                )
+        FROM deadlock_queries AS dq
+        GROUP BY
+            dq.database_name,
+            dq.sql_handle,
+            dq.stmtstart,
+            dq.stmtend,
+            dq.proc_name
+        HAVING
+            COUNT_BIG(DISTINCT dq.event_date) * 10 >=
+            (
+                SELECT
+                    COUNT_BIG(DISTINCT dq2.event_date)
+                FROM deadlock_queries AS dq2
+            )
         OPTION(RECOMPILE);
 
         RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
@@ -4214,9 +4399,18 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
            
                 RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
+                /*
+                When @SkipExecutionPlans = 1, skip gathering and returning the
+                execution plans result set and jump straight to the findings rollup.
+                */
+                IF @SkipExecutionPlans = 1
+                BEGIN
+                    GOTO ReturnDeadlockFindings;
+                END;
+
                 SET @d = CONVERT(varchar(40), GETDATE(), 109);
                 RAISERROR('Getting available execution plans for deadlocks %s', 0, 1, @d) WITH NOWAIT;
-             
+
                 SELECT DISTINCT
                     available_plans =
                         'available_plans',
@@ -4407,10 +4601,12 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
                 OPTION(RECOMPILE, LOOP JOIN, HASH JOIN);
 
                 RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
-           
+
+                ReturnDeadlockFindings:
+
                 SET @d = CONVERT(varchar(40), GETDATE(), 109);
                 RAISERROR('Returning findings %s', 0, 1, @d) WITH NOWAIT;
-           
+
                 SELECT
                     df.check_id,
                     df.database_name,
@@ -4568,7 +4764,9 @@ To use sp_BlitzLock in Azure SQL DB, you have two options:
             OutputTableName =
                 @OutputTableName,
             ExportToExcel =
-                @ExportToExcel;
+                @ExportToExcel,
+            SkipExecutionPlans =
+                @SkipExecutionPlans;
 
         SELECT
             declared_variables =
